@@ -47,6 +47,9 @@ def main():
                         help="Kernel command-line arguments")
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "boot_d2s_xnu.img",
                         help="Output boot image path")
+    parser.add_argument("--adt", type=Path,
+                        help="Use this ADT instead of regenerating d2s.adt "
+                             "(e.g. one from tools/d2s_adt_add_cpus.py)")
     parser.add_argument("--no-build-shim", action="store_true",
                         help="Skip recompiling shim/d2s/out/Image")
     args = parser.parse_args()
@@ -61,9 +64,13 @@ def main():
         sys.exit(f"Error: {shim_img} does not exist. Run build.sh inside shim/d2s.")
 
     # 2. Build ADT
-    adt_path = REPO_ROOT / "d2s.adt"
-    print(f"[*] Step 2: Generating Apple Device Tree ({args.canvas})...")
-    run([sys.executable, str(REPO_ROOT / "tools" / "mkadt_d2s.py"), str(adt_path), "--canvas", args.canvas])
+    if args.adt:
+        adt_path = args.adt
+        print(f"[*] Step 2: Using Apple Device Tree {adt_path}")
+    else:
+        adt_path = REPO_ROOT / "d2s.adt"
+        print(f"[*] Step 2: Generating Apple Device Tree ({args.canvas})...")
+        run([sys.executable, str(REPO_ROOT / "tools" / "mkadt_d2s.py"), str(adt_path), "--canvas", args.canvas])
 
     # 3. Pack Payload
     payload_path = REPO_ROOT / "payload_d2s.bin"

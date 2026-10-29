@@ -1,0 +1,208 @@
+diff --git a/bsd/dev/a5xelte_emmc.c b/bsd/dev/a5xelte_emmc.c
+index ffd011a..d3ff379 100644
+--- a/bsd/dev/a5xelte_emmc.c
++++ b/bsd/dev/a5xelte_emmc.c
+@@ -108,12 +108,21 @@ emmc_read_sector(uint32_t lba, uint8_t *sector)
+ 	uint32_t ints = emmc_rd(EMMC_INTMASK);
+ 	int error = 0;
+ 
++#if defined(D2S)
++	if (width > 2 || ver == 0 || ver == 0xffff) {
++#else
+ 	if (width > 2 || ver == 0 || ver == 0xffff ||
+ 	    !(emmc_rd(EMMC_PWREN) & 1u) || !(emmc_rd(EMMC_CLKENA) & 1u)) {
++#endif
+ 		printf("A5XELTE eMMC: host unavailable (ver=%x hcon=%x clk=%x)\n",
+ 		    ver, hcon, emmc_rd(EMMC_CLKENA));
+ 		return ENXIO;
+ 	}
++#if defined(D2S)
++	/* S-Boot leaves the microSD host unpowered and unclocked. */
++	emmc_wr(EMMC_PWREN, 1);
++	emmc_wr(EMMC_CLKENA, 1);
++#endif
+ 	unit = 2u << width;
+ 	words = 512u / unit;
+ 	if (emmc_rd(EMMC_STATUS) & (1u << 9)) {
+@@ -446,7 +455,11 @@ emmc_map_host(void)
+ 	}
+ 	if (SecureDTLookupEntry(NULL, "/a5xelte-emmc", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++#if defined(D2S)
++	    size < 2 * sizeof(uintptr_t) || reg[0] != D2S_SD_PHYS || reg[1] < 0x2000u) {
++#else
+ 	    size < 2 * sizeof(uintptr_t) || reg[0] != 0x13540000u || reg[1] < 0x2000u) {
++#endif
+ 		printf("A5XELTE eMMC: missing or unexpected ADT register window\n");
+ 		return ENXIO;
+ 	}
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+index dcbd143..37bdfbb 100644
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -18,7 +18,9 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ 
+-#if defined(DREAMLTE)
++#if defined(D2S)
++#define A5_ALIVE_PA D2S_ALIVE_PHYS         /* Exynos 9825 pinctrl ALIVE */
++#elif defined(DREAMLTE)
+ #define A5_ALIVE_PA 0x164b0000u            /* Exynos 8895 pinctrl ALIVE */
+ #else
+ #define A5_ALIVE_PA 0x139b0000u
+@@ -48,7 +50,12 @@ a5_keys_read(uint32_t offset)
+  * read 0x044 (GPA1 DAT) and saw nothing. Sample = GPA0 | GPA2 << 8.
+  */
+ typedef uint16_t keys_t;
++#if defined(D2S)
++/* Exynos 9825 ALIVE: GPA0 DAT at 0x004, GPA2 DAT at 0x044. */
++#define KEYS_SAMPLE() ((keys_t)((a5_keys_read(0x04) & 0xff) | (a5_keys_read(0x44) & 0xff) << 8))
++#else
+ #define KEYS_SAMPLE() ((keys_t)((a5_keys_read(0x24) & 0xff) | (a5_keys_read(0x64) & 0xff) << 8))
++#endif
+ #define KEYS_PINS { 12, 3, 4, 6 }
+ #else
+ typedef uint8_t keys_t;
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index ba647a8..3f15f09 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -630,10 +630,18 @@ a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
+  * Battery: MAX77865 on hsi2c_32 (USI13 second HSI2C, 0x10970000), fuel
+  * gauge 0x36 and charger 0x69 (Samsung max77865_fuelgauge.c/_charger.c).
+  */
++#if defined(D2S)
++/* Note 10+: S6SY771 on hsi2c_10, interrupt gpa1-0 (GPA1 DAT at 0x024). */
++#define S8TS_HSI2C_PA           D2S_TOUCH_HSI2C_PHYS
++#define S8BAT_HSI2C_PA          0x10970000u
++#define S8TS_ALIVE_PA           D2S_ALIVE_PHYS
++#define S8TS_GPA1_DAT           0x24u
++#else
+ #define S8TS_HSI2C_PA           0x108e0000u
+ #define S8BAT_HSI2C_PA          0x10970000u
+ #define S8TS_ALIVE_PA           0x164b0000u
+ #define S8TS_GPA1_DAT           0x44u
++#endif
+ #define S8TS_ADDR               0x48u
+ #define S8BAT_FG                0x36u
+ #define S8BAT_CHG               0x69u
+@@ -898,7 +906,12 @@ dreamlte_touch_start(void)
+ 		return;
+ 	}
+ 	s8i2c_reset(s8ts_i2c);
++#if defined(D2S)
++	/* S6SY771 reports a different boot status; only require the read. */
++	if (!s8ts_cmd_read(0x55, b, 1)) {                      /* BOOT_STATUS */
++#else
+ 	if (!s8ts_cmd_read(0x55, b, 1) || b[0] != 0x20) {     /* BOOT_STATUS */
++#endif
+ 		printf("S8 TOUCH: no S6SY761 in application mode (status %#x)\n", b[0]);
+ 		return;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 5bd24a7..1389612 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -87,7 +87,11 @@ SweetCPU::start(IOService *provider)
+ #if defined(A5XELTE)
+ 	/* Linux's Exynos7580 DT: logical 0..3 = MPIDR 0..3;
+ 	 * logical 4..7 = MPIDR 0x100..0x103. */
+-#if defined(DREAMLTE)
++#if defined(D2S)
++	/* Exynos 9825: logical 0..5 = A55/A75 MPIDR 0..5; 6..7 = M4 0x100..0x101. */
++	uint32_t expected_mpidr = cpu->cpu_id < 6 ? cpu->cpu_id :
++	    0x100U + cpu->cpu_id - 6;
++#elif defined(DREAMLTE)
+ 	/* Exynos 8895: logical 0..3 = A53 MPIDR 0x100..0x103 (boot cluster);
+ 	 * logical 4..7 = Mongoose M2 MPIDR 0..3. */
+ 	uint32_t expected_mpidr = cpu->cpu_id < 4 ? 0x100U + cpu->cpu_id :
+@@ -320,7 +324,11 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		entry = (vm_offset_t)tramp_pa;
+ 		static vm_offset_t pmu;
+ 		if (pmu == 0) {
++#if defined(D2S)
++			pmu = ml_io_map(D2S_PMU_PHYS, 0x10000);
++#else
+ 			pmu = ml_io_map(0x16480000, 0x10000);
++#endif
+ 		}
+ 		uint32_t off = 0x2000 + (uint32_t)(((((cpu->phys_id >> 8) & 0xf) << 2) |
+ 		    (cpu->phys_id & 0xf)) * 0x80);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index ec6b9da..381aa2d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -257,6 +257,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
++#if defined(D2S)
++		step = 7;       /* d2s: no CPU fade while the panel is off */
++#endif
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
+@@ -332,7 +335,11 @@ static void
+ sweet_fb_wait_frame_done(void)
+ {
+ 	if (sweet_fb_decon == 0) {
++#if defined(D2S)
++		sweet_fb_decon = ml_io_map(D2S_DECON_PHYS, 0x1000);
++#else
+ 		sweet_fb_decon = ml_io_map(0x12860000, 0x1000);
++#endif
+ 		if (sweet_fb_decon == 0) {
+ 			return;
+ 		}
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 1606c91..ae79267 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -886,7 +886,13 @@ common_start:
+ #endif /* HAS_APPLE_PAC */
+ 
+ 	// Enable caches, MMU, ROP and JOP
++#if defined(D2S)
++	/* Exynos 9825 cores implement PAN. SPAN (bit 23) = 1 leaves PSTATE.PAN
++	 * alone on exception entry; with 0 every exception sets PAN. */
++	MOV64   x0, (SCTLR_EL1_DEFAULT | (1 << 23))
++#else
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
++#endif
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
+ 
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index b6f812d..c242894 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -61,6 +61,28 @@
+ #define A5_TOUCH_DEFAULT              1
+ #endif
+ 
++/*
++ * Samsung Galaxy Note 10+ (SM-N975F, d2s, Exynos 9825), built on the
++ * DREAMLTE port. The values below are the ones the d2s bring-up kernel
++ * (xnu_out/kernel.development.d2s_touch_v2) was hand-patched with.
++ */
++#define D2S                           1
++#if defined(D2S)
++#undef A5_FB_PHYS
++#define A5_FB_PHYS                    0xca000000  /* decon_fb@0xCA000000 */
++#undef A5_ENTRY_MARKER_PHYS
++#define A5_ENTRY_MARKER_PHYS          0xeb30f000  /* shim/d2s XNU_MARKER_PHYS */
++#undef A5_BOOT_MPIDR
++#define A5_BOOT_MPIDR                 0x0         /* first Cortex-A55 */
++#undef A5_KLOG_PHYS
++#define A5_KLOG_PHYS                  0xfd910000  /* d2s log_kernel zone */
++#define D2S_PMU_PHYS                  0x15860000  /* pmu_system_controller */
++#define D2S_DECON_PHYS                0x19030000  /* DECON_F */
++#define D2S_SD_PHYS                   0x13d00000  /* dwmmc2 (microSD) */
++#define D2S_ALIVE_PHYS                0x15850000  /* pinctrl@15850000 (ALIVE) */
++#define D2S_TOUCH_HSI2C_PHYS          0x104b0000  /* hsi2c_10: S6SY771 */
++#endif
++
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+ #endif

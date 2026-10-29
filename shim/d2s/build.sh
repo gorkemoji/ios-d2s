@@ -39,7 +39,7 @@ $CC $CFLAGS -static -T loader.ld -Wl,--build-id=none -Wl,-N \
 
 $OBJCOPY -O binary out/loader.elf out/Image
 
-size=$($NM out/loader.elf | awk '$3=="_end"{printf "%d", "0x"$1}')
+size=$(( 0x$($NM out/loader.elf | awk '$3=="_end"{print $1}') ))
 truncate -s "$size" out/Image
 
 if stat -f %z out/Image >/dev/null 2>&1; then

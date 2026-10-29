@@ -1,0 +1,65 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 1389612..e9547f9 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -88,9 +88,17 @@ SweetCPU::start(IOService *provider)
+ 	/* Linux's Exynos7580 DT: logical 0..3 = MPIDR 0..3;
+ 	 * logical 4..7 = MPIDR 0x100..0x103. */
+ #if defined(D2S)
+-	/* Exynos 9825: logical 0..5 = A55/A75 MPIDR 0..5; 6..7 = M4 0x100..0x101. */
+-	uint32_t expected_mpidr = cpu->cpu_id < 6 ? cpu->cpu_id :
+-	    0x100U + cpu->cpu_id - 6;
++	/*
++	 * Exynos 9825 cores: A55 MPIDR 0..3, A75 4..5, M4 0x100..0x101. XNU
++	 * numbers CPUs in ADT order and the ADT lists the boot A55 first, then
++	 * the M4s (started by PSCI alone in the loader probe), then the rest,
++	 * so cpus=N picks a prefix. Accept any of them in any slot.
++	 */
++	uint32_t expected_mpidr = cpu->phys_id;
++	if (cpu->cpu_id == 0 || !(cpu->phys_id <= 5 || cpu->phys_id == 0x100 ||
++	    cpu->phys_id == 0x101)) {
++		expected_mpidr = cpu->cpu_id == 0 ? A5_BOOT_MPIDR : ~0U;
++	}
+ #elif defined(DREAMLTE)
+ 	/* Exynos 8895: logical 0..3 = A53 MPIDR 0x100..0x103 (boot cluster);
+ 	 * logical 4..7 = Mongoose M2 MPIDR 0..3. */
+@@ -322,13 +330,29 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u entry 0x%llx via low trampoline 0x%llx\n",
+ 		    getCPUNumber(), (uint64_t)entry, tramp_pa);
+ 		entry = (vm_offset_t)tramp_pa;
++#if defined(D2S)
++		/*
++		 * Exynos 9825: the EL3 firmware powers the core itself (Samsung's
++		 * 9820 kernel boots secondaries with plain PSCI CPU_ON, and the
++		 * loader probe started both M4s that way). Log the PMU state only;
++		 * per-core CONFIGURATION/STATUS at 0x1000/0x1004 + exynos-pmu.c
++		 * pmu_cpu_offset().
++		 */
+ 		static vm_offset_t pmu;
+ 		if (pmu == 0) {
+-#if defined(D2S)
+ 			pmu = ml_io_map(D2S_PMU_PHYS, 0x10000);
++		}
++		uint32_t m = cpu->phys_id;
++		uint32_t off = (m & 0x100) ? 0x500 + (m & 1) * 0x80 :
++		    (m < 4 ? m * 0x80 : 0x300 + (m - 4) * 0x80);
++		volatile uint32_t *cfg = (volatile uint32_t *)(pmu + 0x1000 + off);
++		IOLog(CPU_PORT_NAME " CPU: cpu=%u d2s PMU cfg=0x%x status=0x%x before CPU_ON\n",
++		    getCPUNumber(), cfg[0], cfg[1]);
++	}
+ #else
++		static vm_offset_t pmu;
++		if (pmu == 0) {
+ 			pmu = ml_io_map(0x16480000, 0x10000);
+-#endif
+ 		}
+ 		uint32_t off = 0x2000 + (uint32_t)(((((cpu->phys_id >> 8) & 0xf) << 2) |
+ 		    (cpu->phys_id & 0xf)) * 0x80);
+@@ -352,6 +376,7 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ 		IOLog(CPU_PORT_NAME " CPU: cpu=%u first CPU_ON rc=%d, PMU power-up cfg=0x%x status=0x%x\n",
+ 		    getCPUNumber(), rc0, cfg[0], cfg[1]);
+ 	}
++#endif /* D2S */
+ #endif
+ 	__builtin_arm_dsb(DSB_SY);
+ 	int32_t rc = sweet_psci_cpu_on(cpu->phys_id, entry, getCPUNumber());

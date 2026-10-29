@@ -62,16 +62,17 @@ _start:
 	b	4b
 
 /*
- * smp_probe.c target: a started secondary marks smp_flags[(Aff1 & 1) << 2 |
- * Aff0] (independent of the PSCI context id) and powers itself off again.
+ * smp_probe.c target: a started secondary marks smp_flags[(Aff0 + 6 * Aff1) & 7] (independent of the PSCI context id) and powers itself off again.
  */
 	.globl smp_entry
 smp_entry:
 	msr	daifset, #0xf
 	mrs	x10, mpidr_el1
-	ubfx	x11, x10, #8, #1
-	and	x12, x10, #3
-	orr	x12, x12, x11, lsl #2
+	and	x12, x10, #7		/* Aff0 */
+	ubfx	x11, x10, #8, #1	/* Aff1 bit 0 */
+	add	x13, x11, x11, lsl #1	/* 3 * Aff1 */
+	add	x12, x12, x13, lsl #1	/* + 6 * Aff1 */
+	and	x12, x12, #7
 	adr	x13, smp_flags
 	mov	x14, #1
 	str	x14, [x13, x12, lsl #3]

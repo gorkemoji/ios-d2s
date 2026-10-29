@@ -387,6 +387,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	}
 	out("\n");
 	touch_probe(kv, out);
+	/* smp_probe(kv, out);  core-start test, see smp_probe.c */
 	clean(ba_pa, ba_pa + PAGE_SIZE);
 	fg = 0xff40ff40U;
 	out("\nJUMP TO XNU\n");

@@ -1,0 +1,132 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 381aa2d..4508d13 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -201,6 +201,10 @@ AppleCLCD::start(IOService *provider)
+ #endif
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++#if defined(D2S)
++	PE_parse_boot_argn("d2sfb_scale", &d2s_fb_scale, sizeof(d2s_fb_scale));
++	IOLog("SWEET FB: d2s scale mode %u (0 centred 1:1, 1 stretch, 2 keep shape)\n", d2s_fb_scale);
++#endif
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -384,6 +388,69 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ }
+ 
++#if defined(D2S)
++/*
++ * d2s: iOS draws the iPhone X canvas (1125x2436); the panel is 1440x3040.
++ * d2sfb_scale=1 (default) stretches the canvas over the whole panel
++ * (x 1.28, y 1.248: 2.6% wider than true shape), 2 keeps the shape (1404
++ * wide, 18 px bars), 0 is the 1:1 centred copy. Nearest neighbour in
++ * 16.16 fixed point; the logical rect (dx,dy,w,h) of a layer maps to the
++ * panel rect it covers.
++ */
++static uint32_t d2s_fb_scale = 1;
++static bool d2s_fb_cleared;
++
++static void
++d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
++    uint32_t lw, uint32_t lh, const uint8_t *src, uint32_t sbpr,
++    int32_t sx, int32_t sy, int32_t dx, int32_t dy, int32_t w, int32_t h)
++{
++	/* logical -> panel: p = o + l * k (k in 16.16) */
++	uint64_t kx = ((uint64_t)pw << 16) / lw, ky = ((uint64_t)ph << 16) / lh;
++	uint64_t ox = 0, oy = 0;
++	if (d2s_fb_scale == 2) {
++		kx = ky = kx < ky ? kx : ky;
++		ox = (pw - ((lw * kx) >> 16)) / 2;
++		oy = (ph - ((lh * ky) >> 16)) / 2;
++		if (!d2s_fb_cleared) {
++			for (uint32_t y = 0; y < ph; y++) {
++				bzero((void *)(panel + (uint64_t)y * rowBytes), (size_t)pw * 4);
++			}
++			d2s_fb_cleared = true;
++		}
++	}
++	/* rounded edges: 1125 * 1.28 = 1439.99 must reach column 1440 */
++	uint64_t px0 = ox + (((uint64_t)dx * kx + 0x8000) >> 16);
++	uint64_t px1 = ox + (((uint64_t)(dx + w) * kx + 0x8000) >> 16);
++	uint64_t py0 = oy + (((uint64_t)dy * ky + 0x8000) >> 16);
++	uint64_t py1 = oy + (((uint64_t)(dy + h) * ky + 0x8000) >> 16);
++	if (px1 > pw) {
++		px1 = pw;
++	}
++	if (py1 > ph) {
++		py1 = ph;
++	}
++	if (px0 >= px1 || py0 >= py1) {
++		return;
++	}
++	/* panel -> logical step (16.16) */
++	uint64_t ix = ((uint64_t)1 << 32) / kx, iy = ((uint64_t)1 << 32) / ky;
++	for (uint64_t py = py0; py < py1; py++) {
++		int64_t ly = (int64_t)((((py - oy) << 16) + (1 << 15)) * iy >> 32) - dy;
++		ly = ly < 0 ? 0 : (ly >= h ? h - 1 : ly);
++		const uint32_t *srow = (const uint32_t *)(src + (uint64_t)(sy + ly) * sbpr) + sx;
++		uint32_t *drow = (uint32_t *)(panel + py * rowBytes);
++		uint64_t fx = (((px0 - ox) << 16) + (1 << 15)) * ix >> 16;     /* logical x, 16.16 */
++		int64_t base = (int64_t)dx << 16;
++		for (uint64_t px = px0; px < px1; px++, fx += ix) {
++			int64_t lx = ((int64_t)fx - base) >> 16;
++			lx = lx < 0 ? 0 : (lx >= w ? w - 1 : lx);
++			drow[px] = srow[lx];
++		}
++	}
++}
++#endif
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -443,6 +510,32 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++#if defined(D2S)
++		if (d2s_fb_scale != 0 && (fLogicalW != fWidth || fLogicalH != fHeight)) {
++			/* clip in logical space, then scale onto the panel */
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			if (w > (int32_t)fLogicalW - dx) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (h > (int32_t)fLogicalH - dy) {
++				h = (int32_t)fLogicalH - dy;
++			}
++			uint64_t end = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++			    (uint64_t)(sx + w) * 4;
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
++			    s->elementHeight == 1 && s->memory != NULL && end <= s->memory->getLength()) {
++				d2s_present_scaled(fPixels, fRowBytes, fWidth, fHeight, fLogicalW, fLogicalH,
++				    (const uint8_t *)(src + s->offset), s->bytesPerRow, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
++#endif
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index c242894..3eb6f6a 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -76,6 +76,9 @@
+ #define A5_BOOT_MPIDR                 0x0         /* first Cortex-A55 */
+ #undef A5_KLOG_PHYS
+ #define A5_KLOG_PHYS                  0xfd910000  /* d2s log_kernel zone */
++/* 6.8" panel: 1440x3040, 32 bpp (A5_FB_2M_BLOCKS 9 still covers 17.5 MB). */
++#undef A5_FB_HEIGHT
++#define A5_FB_HEIGHT                  3040
+ #define D2S_PMU_PHYS                  0x15860000  /* pmu_system_controller */
+ #define D2S_DECON_PHYS                0x19030000  /* DECON_F */
+ #define D2S_SD_PHYS                   0x13d00000  /* dwmmc2 (microSD) */

@@ -21,7 +21,7 @@ DEFAULT_CMDLINE = (
     "debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress rd=ufsroot0 "
     "ufsroot=iosroot unentitled_ios_sim_launch=1 ignition_level=1 "
     "wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 "
-    "wdt=-1 sweetfb_noconsole=1 sweetfb_hz=15 a5keys=1 s8touch=1 "
+    "wdt=-1 a5fb_noconsole=1 sweetfb_hz=15 a5keys=1 s8touch=1 "
     "sweetbattery=0 cs_enforcement_disable=1 amfi_get_out_of_my_way=1"
 )
 

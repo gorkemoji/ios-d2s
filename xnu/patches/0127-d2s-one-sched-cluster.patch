@@ -1,0 +1,23 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 6d56a33..6380312 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -1050,7 +1050,17 @@ ml_parse_cpu_topology(void)
+ 		 * on the value provided by EDT. Instead, use the MPIDR value to see if we have
+ 		 * seen this exact cluster before. If so, then reuse that cluster ID for this CPU.
+ 		 */
+-#if HAS_CLUSTER || defined(A5XELTE)
++#if defined(D2S)
++		/*
++		 * One scheduler cluster for every Exynos 9825 core (A55/A75 Aff1 0,
++		 * M4 Aff1 1), as the SWEET donor runs its A55+A76 cores. This XNU's
++		 * Clutch scheduler (no Edge) keeps one clutch bucket per thread group
++		 * and QoS, which can sit in only one pset's root; with two psets the
++		 * first M4 thread hit sched_clutch.c:2425 (scb_root != root_clutch).
++		 * Only the PPL (XNU_MONITOR, off here) indexes cluster_offsets by Aff1.
++		 */
++		uint32_t phys_cluster_id = 0;
++#elif HAS_CLUSTER || defined(A5XELTE)
+ 		uint32_t phys_cluster_id = MPIDR_CLUSTER_ID(cpu->phys_id);
+ #else
+ 		uint32_t phys_cluster_id = (cpu->cluster_type == CLUSTER_TYPE_P);

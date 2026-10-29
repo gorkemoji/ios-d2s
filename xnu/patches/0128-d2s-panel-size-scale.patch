@@ -1,8 +1,19 @@
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
-index 381aa2d..4508d13 100644
+index 381aa2d..437eea2 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -201,6 +201,10 @@ AppleCLCD::start(IOService *provider)
+@@ -37,6 +37,10 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++#if defined(D2S)
++static uint32_t d2s_fb_scale = 1;       /* boot-arg d2sfb_scale, see d2s_present_scaled */
++static bool d2s_fb_cleared;
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <IOKit/IOService.h>
+@@ -201,6 +205,10 @@ AppleCLCD::start(IOService *provider)
  #endif
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -13,7 +24,7 @@ index 381aa2d..4508d13 100644
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -384,6 +388,69 @@ AppleCLCD::swap(const uint8_t *rec)
+@@ -384,6 +392,66 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  }
  
@@ -24,11 +35,8 @@ index 381aa2d..4508d13 100644
 + * (x 1.28, y 1.248: 2.6% wider than true shape), 2 keeps the shape (1404
 + * wide, 18 px bars), 0 is the 1:1 centred copy. Nearest neighbour in
 + * 16.16 fixed point; the logical rect (dx,dy,w,h) of a layer maps to the
-+ * panel rect it covers.
++ * panel rect it covers. (d2s_fb_scale is declared at the top of the file.)
 + */
-+static uint32_t d2s_fb_scale = 1;
-+static bool d2s_fb_cleared;
-+
 +static void
 +d2s_present_scaled(uintptr_t panel, uint32_t rowBytes, uint32_t pw, uint32_t ph,
 +    uint32_t lw, uint32_t lh, const uint8_t *src, uint32_t sbpr,
@@ -83,7 +91,7 @@ index 381aa2d..4508d13 100644
  void
  AppleCLCD::present(const uint8_t *rec)
  {
-@@ -443,6 +510,32 @@ AppleCLCD::present(const uint8_t *rec)
+@@ -443,6 +511,32 @@ AppleCLCD::present(const uint8_t *rec)
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}

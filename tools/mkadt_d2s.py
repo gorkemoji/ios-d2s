@@ -7,8 +7,8 @@ from pathlib import Path
 import adt
 import mkadt
 
-DRAM_BASE = 0x880000000
-DRAM_SIZE = 0x20000000  # 512 MiB initial bring-up bank
+DRAM_BASE = 0x900000000
+DRAM_SIZE = 0x20000000  # 512 MiB initial bring-up bank (clean high DRAM above 0x880000000 sec_rdx_bootdev)
 FB_PHYS, FB_W, FB_H = 0xca000000, 1440, 3040
 TIMEBASE = 26000000
 
@@ -50,7 +50,7 @@ def cpu_node(logical):
 
     return [
         ('device_type', mkadt.cstr('cpu')),
-        ('compatible', mkadt.cstr(compat) + mkadt.cstr('ARM,v8')),
+        ('compatible', mkadt.cstr(compat) + mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
         ('reg', mkadt.u32(mpidr)),
         ('cpu-id', mkadt.u32(logical)),
         ('cluster-id', mkadt.u32(cluster)),
@@ -90,8 +90,8 @@ def build(canvas=(FB_W, FB_H)):
         if key != 'cpu-id':
             set_prop(cpu0, key, value)
 
-    for logical in range(1, 8):
-        cpus.children.append(mkadt.node(f'cpu{logical}', cpu_node(logical)))
+    # Single-core initial bring-up (cpu0 = Cortex-A55 MPIDR 0x0)
+    cpus.children = [cpu0]
 
     arm_io = child(root, 'arm-io')
     set_prop(arm_io, 'device_type', mkadt.cstr('d2s-io'))
@@ -127,7 +127,12 @@ def build(canvas=(FB_W, FB_H)):
         ('stride', mkadt.u32(FB_W * 4)),
     ]))
 
-    # Exynos 9825 UFS 3.0: 0x13d60000
+    # Exynos 9825 MicroSD controller: dwmmc2@13D00000
+    root.children.append(mkadt.node('a5xelte-emmc', [
+        ('reg', mkadt.u64(0x13d00000, 0x2000)),
+    ]))
+
+    # Exynos 9825 UFS 3.0 controller: 13D60000 (bsd/dev/sweet_ufs.c, EXYNOS_UFS)
     root.children.append(mkadt.node('dreamlte-ufs', [
         ('reg', mkadt.u64(0x13d60000, 0x200, 0x13d61100, 0x200)),
     ]))

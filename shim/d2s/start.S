@@ -16,7 +16,7 @@ _head:
 	.quad	0xa			/* flags: LE, 4K pages, place anywhere */
 	.quad	0
 	.quad	0
-	.quad	0
+	.quad	0x00000000ecefecef	/* Exynos 9825 S-Boot header marker */
 	.ascii	"ARM\x64"		/* magic */
 	.long	0
 

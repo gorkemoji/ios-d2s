@@ -20,26 +20,31 @@
 #include "touch_probe.h"
 #include "pmic.h"
 #include "display_probe.h"
+#include "sd_probe.h"
 
 #define UFS_PROBE_DMA		0x8f0000000UL	/* high bank, outside XNU's window */
 
-/* ---- board facts (s8-probe v2-v7, live DT, /proc/iomem) ---- */
-#define FB_BASE			0xca000000UL	/* s3cfb.bootloaderfb */
+/* ---- board facts (Galaxy Note 10+ / SM-N975F / d2s / Exynos 9825) ---- */
+#define FB_BASE			0xca000000UL	/* decon_fb@0xCA000000 */
 #define FB_W			1440
-#define FB_H			2960
+#define FB_H			3040
 #define FB_STRIDE		(FB_W * 4)
-#define DECON_TRIG		0x12860070UL	/* DECON_F HW_SW_TRIG_CONTROL */
-#define DECON_TRIG_UNMASK	0x1281U		/* uniLoader dreamlte */
-#define RAMOOPS_CONSOLE		0x92080000UL	/* TWRP ramoops console zone */
-#define RAMOOPS_CONSOLE_SIZE	0x80000UL
+#define DECON_SHADOW		0x19030060UL	/* DECON_F SHADOW_REG_UPDATE_REQ */
+#define DECON_TRIG		0x19030070UL	/* DECON_F HW_SW_TRIG_CONTROL */
+#define DECON_TRIG_UNMASK	0x1281U		/* Exynos DECON_F TE trigger unmask */
+#define RAMOOPS_CONSOLE		0xeb308000UL	/* d2s log_pstore zone */
+#define RAMOOPS_CONSOLE_SIZE	0x008000UL
 #define PRZ_SIG			0x43474244U	/* "DBGC" */
-#define XNU_MARKER_PHYS		0x920ff000UL	/* A5_ENTRY_MARKER_PHYS in 0124 */
-#define LOW_RAM_BASE		0x80000000UL	/* initrd must be in the low bank */
-#define LOW_RAM_END		0xbc800000UL
-#define XNU_RAM_BASE		0x880000000UL	/* 2 GiB high bank */
-#define XNU_RAM_END		0x900000000UL
+#define XNU_MARKER_PHYS		0xeb30f000UL	/* A5_ENTRY_MARKER_PHYS patched for d2s */
+#define LOW_RAM_BASE		0x80000000UL	/* low DRAM bank */
+#define LOW_RAM_END		0xc0000000UL
+#define XNU_RAM_BASE		0x900000000UL	/* clean high DRAM bank above sec_rdx_bootdev */
+#define XNU_RAM_END		0x980000000UL
 #define PAGE_SIZE		4096UL
 #define BOOT_LINE_LENGTH	608
+#define EMBED_PAYLOAD_OFF	0x40000UL	/* 256 KiB offset from _head when embedded */
+
+extern const char _head[];
 
 /* ---- persistent log ----
  * The same text goes to two ramoops zones with separate headers: the
@@ -51,7 +56,8 @@ struct prz {
 	uint32_t sig, start, size;
 	uint8_t data[];
 };
-#define RAMOOPS_PMSG		0x92180000UL	/* after dump, console, ftrace */
+#define RAMOOPS_PMSG		0xfd910000UL	/* d2s log_kernel zone */
+#define RAMOOPS_PMSG_SIZE	0x080000UL
 static volatile struct prz *const prz = (volatile struct prz *)RAMOOPS_CONSOLE;
 static volatile struct prz *const prz2 = (volatile struct prz *)RAMOOPS_PMSG;
 #define PRZ_DATA_MAX	(RAMOOPS_CONSOLE_SIZE - 12)
@@ -115,11 +121,20 @@ static void scr_ch(char c)
 	col++;
 }
 
+static void decon_kick(void)
+{
+	*(volatile uint32_t *)DECON_TRIG = DECON_TRIG_UNMASK;
+	*(volatile uint32_t *)DECON_SHADOW |= 0x8000003fU;
+}
+
 static void out(const char *s)
 {
 	while (*s) {
-		log_ch(*s);
-		scr_ch(*s++);
+		char c = *s++;
+		log_ch(c);
+		scr_ch(c);
+		if (c == '\n')
+			decon_kick();
 	}
 }
 
@@ -246,80 +261,43 @@ static void reserve_marker(void)
 	log_ch1('\n');
 }
 
-/* Days since 1970-01-01 of a proleptic Gregorian date (Howard Hinnant). */
-static int64_t days_from_civil(int64_t y, unsigned m, unsigned d)
-{
-	y -= m <= 2;
-	int64_t era = (y >= 0 ? y : y - 399) / 400;
-	unsigned yoe = (unsigned)(y - era * 400);
-	unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-	unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-	return era * 146097 + (int64_t)doe - 719468;
-}
-
-/* XNU's platform expert has no clock on the S8 (iOS showed 1969). Pass the
- * PMIC RTC as "s8rtc=" = UTC seconds at system-counter zero; the kernel
- * adds the counter (patch 0124, PEGetUTCTimeOfDay). RTC bytes from 0x04:
- * msec, sec, min, hour, weekday mask, day, month, year-2000 (boot 26). */
-static void rtc_bootarg(volatile struct boot_args *ba, uint64_t raw)
-{
-	unsigned sec = (raw >> 8) & 0x7f, min = (raw >> 16) & 0x7f;
-	unsigned hour = (raw >> 24) & 0x1f, day = (raw >> 40) & 0x1f;
-	unsigned mon = (raw >> 48) & 0x0f, year = 2000 + ((raw >> 56) & 0x7f);
-	if (sec > 59 || min > 59 || hour > 23 || !day || !mon || mon > 12 || year < 2024)
-		return;
-	int64_t t = days_from_civil(year, mon, day) * 86400 + hour * 3600 + min * 60 + sec;
-	uint64_t cnt;
-	__asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(cnt));
-	t -= (int64_t)(cnt / 26000000);
-	kv("rtc unix", (uint64_t)t);
-	out("\n");
-	char num[24];
-	int n = 0;
-	do {
-		num[n++] = (char)('0' + t % 10);
-		t /= 10;
-	} while (t && n < 20);
-	int at = 0;
-	while (at < BOOT_LINE_LENGTH && ba->CommandLine[at])
-		at++;
-	const char *key = " s8rtc=";
-	if (at + 7 + n >= BOOT_LINE_LENGTH)
-		return;
-	for (int i = 0; key[i]; i++)
-		ba->CommandLine[at++] = key[i];
-	while (n)
-		ba->CommandLine[at++] = num[--n];
-	ba->CommandLine[at] = 0;
-}
-
 uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 {
-	*(volatile uint32_t *)DECON_TRIG = DECON_TRIG_UNMASK;
+	decon_kick();
 	prz->sig = PRZ_SIG;
 	prz->start = prz->size = 0;
 	prz2->sig = PRZ_SIG;
 	prz2->start = prz2->size = 0;
 	fill(0, 0, FB_W, FB_H, 0xff000000U);
-	fg = 0xffffff00U;
-	out("S8LOADER BEGIN  (ios-s8 dreamlte XNU loader)\n");
+	fg = 0xff00ffffU;
+	out("D2SLOADER BEGIN (Galaxy Note 10+ Exynos 9825 XNU Loader)\n");
 	fg = 0xffffffffU;
 	kv("EL", el);
 	kv("SCTLR", sctlr);
 	kv("DTB", dtb);
+	kv("HEAD", (uintptr_t)_head);
 	out("\n");
+	decon_kick();
 	if (el != 1)
 		return fail("not entered at EL1");
 
-	uint64_t rd_start, rd_end;
-	if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
-	    !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end))
-		return fail("no initrd in /chosen");
-	kv("initrd", rd_start);
+	uint64_t rd_start = 0, rd_end = 0;
+	uintptr_t embed_cand = (uintptr_t)_head + EMBED_PAYLOAD_OFF;
+	if (magic_ok(((const volatile struct payload *)embed_cand)->magic)) {
+		const volatile struct payload *ep = (const volatile struct payload *)embed_cand;
+		rd_start = embed_cand;
+		rd_end = embed_cand + ep->adt_off + ep->adt_size;
+		out("payload: embedded at _head+0x40000\n");
+	} else if (!fdt_chosen_u64(dtb, "linux,initrd-start", &rd_start) ||
+		   !fdt_chosen_u64(dtb, "linux,initrd-end", &rd_end)) {
+		return fail("no embedded payload and no initrd in /chosen");
+	}
+	kv("payload", rd_start);
 	kv("end", rd_end);
 	out("\n");
+	decon_kick();
 	if (rd_start < LOW_RAM_BASE || rd_end > LOW_RAM_END || rd_end <= rd_start)
-		return fail("initrd outside low RAM");
+		return fail("payload outside low RAM");
 
 	const volatile struct payload *p = (const volatile struct payload *)rd_start;
 	uint64_t length = rd_end - rd_start;
@@ -408,21 +386,13 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 		out(c);
 	}
 	out("\n");
-	ufs_probe(kv, out, UFS_PROBE_DMA);
-	rtc_bootarg(ba, pmic_init(kv, out));
-	clean(ba_pa, ba_pa + PAGE_SIZE);
 	touch_probe(kv, out);
-	battery_probe(kv, out);
-	display_probe(kv, out);
-	mngs_probe(kv, out);
-	/* smp_probe(kv, out) proved the PMU power-up (boot 19); it leaves the
-	 * probed cores' PMU power on, which hid the 0 -> 0xF edge XNU needs. */
-	(void)smp_probe;
+	clean(ba_pa, ba_pa + PAGE_SIZE);
 	fg = 0xff40ff40U;
 	out("\nJUMP TO XNU\n");
 	reserve_marker();
 	clean(RAMOOPS_CONSOLE, RAMOOPS_CONSOLE + RAMOOPS_CONSOLE_SIZE);
-	clean(RAMOOPS_PMSG, RAMOOPS_PMSG + RAMOOPS_CONSOLE_SIZE);
+	clean(RAMOOPS_PMSG, RAMOOPS_PMSG + RAMOOPS_PMSG_SIZE);
 	return entry_pa;
 }
 

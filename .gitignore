@@ -1,6 +1,5 @@
 # device dumps: persist/modemst/fsg hold IMEI + calibration; live DT holds the serial
 backup/
-dtb/
 recovery/
 # third-party/Apple sources fetched for reading
 research/
@@ -9,8 +8,15 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+*.pyc
 shim/a5xelte/out/
 shim/a5xelte/out4k/
 shim/a5xelte/outxnu/
 shim/dreamlte/out/
+shim/d2s/out/*.o
+shim/d2s/out/*.elf
 logs/
+*.img
+payload*.bin
+kblob*.bin
+boot*.img

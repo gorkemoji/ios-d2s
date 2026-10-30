@@ -1,0 +1,20 @@
+name: d2s-gpu-tools
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/d2s-gpu/**'
+      - '.github/workflows/d2s-gpu-tools.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build d2sgpu-test (iOS arm64)
+        run: sh tools/d2s-gpu/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: d2s-gpu-tools
+          path: tools/d2s-gpu/out/

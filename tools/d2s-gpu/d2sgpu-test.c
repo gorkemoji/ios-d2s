@@ -1,0 +1,113 @@
+/*
+ * d2sgpu-test: GPU step 3b check from user space on the d2s.
+ *
+ * Opens D2SGPU, maps a job buffer and a result buffer into this process,
+ * writes a Mali Write Value job with the CPU, runs it, and checks the value
+ * the GPU wrote through the process's own mapping. Then a job that writes
+ * to an unmapped GPU address (must fault, GPU must recover) and one more
+ * job. Every line also goes to the kernel log ("D2S GPU UC: d2sgpu-test:"),
+ * so the result is in the log ring even with no console.
+ */
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include "d2sgpu.h"
+
+static io_connect_t conn = MACH_PORT_NULL;
+
+static void
+say(const char *fmt, ...)
+{
+	char line[150];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n < 0) {
+		return;
+	}
+	if ((size_t)n >= sizeof(line)) {
+		n = sizeof(line) - 1;
+	}
+	printf("%s\n", line);
+	if (conn != MACH_PORT_NULL) {
+		d2sgpu_log(conn, line, (size_t)n);
+	}
+}
+
+/* genxml v7 Write Value job (64 bytes): header, then payload */
+static void
+write_value_job(volatile uint32_t *j, uint64_t dst, uint32_t value)
+{
+	for (int i = 0; i < 16; i++) {
+		j[i] = 0;
+	}
+	j[4] = 1u | 2u << 1 | 1u << 16;	/* is64b, type Write Value, index 1 */
+	j[8] = (uint32_t)dst;
+	j[9] = (uint32_t)(dst >> 32);
+	j[10] = 6;			/* Immediate 32 */
+	j[12] = value;
+}
+
+int
+main(void)
+{
+	conn = d2sgpu_open();
+	if (conn == MACH_PORT_NULL) {
+		printf("d2sgpu-test: cannot open D2SGPU\n");
+		return 1;
+	}
+	struct d2sgpu_info info;
+	if (d2sgpu_info(conn, &info) != KERN_SUCCESS) {
+		say("USER TEST FAIL: GET_INFO");
+		return 1;
+	}
+	say("GPU id %#x shaders %#llx js %#x, my AS%u", info.gpu_id,
+	    (unsigned long long)info.shader_present, info.js_present, info.as);
+
+	struct d2sgpu_buf job = { 0 }, res = { 0 };
+	kern_return_t k1 = d2sgpu_buf_create(conn, 4096, D2SGPU_BUF_GPU_WRITE, &job);
+	kern_return_t k2 = d2sgpu_buf_create(conn, 64 * 1024, D2SGPU_BUF_GPU_WRITE, &res);
+	if (k1 != KERN_SUCCESS || k2 != KERN_SUCCESS || !job.cpu || !res.cpu) {
+		say("USER TEST FAIL: buffers %#x %#x", k1, k2);
+		return 1;
+	}
+	say("job buf %u gpu %#llx cpu %p; result buf %u gpu %#llx size %#llx cpu %p",
+	    job.handle, (unsigned long long)job.gpu_va, job.cpu, res.handle,
+	    (unsigned long long)res.gpu_va, (unsigned long long)res.size, res.cpu);
+
+	volatile uint32_t *j = job.cpu, *r = res.cpu;
+	struct d2sgpu_result out;
+
+	/* 1. the GPU writes into the last page of the result buffer */
+	r[60 * 1024 / 4] = 0x44444444u;
+	write_value_job(j, res.gpu_va + 60 * 1024, 0xD25C0001u);
+	d2sgpu_submit(conn, 0, job.gpu_va, 100000, &out);
+	int ok1 = out.rc == D2SGPU_JOB_DONE && r[60 * 1024 / 4] == 0xD25C0001u;
+	say("job 1: rc %llu in %llu us, result %#x, job status word %#x",
+	    (unsigned long long)out.rc, (unsigned long long)out.us, r[60 * 1024 / 4], j[0]);
+
+	/* 2. a write to an unmapped GPU address must fault */
+	uint64_t hole = res.gpu_va + res.size;	/* the guard page */
+	write_value_job(j, hole, 0xBAD);
+	d2sgpu_submit(conn, 0, job.gpu_va, 100000, &out);
+	int ok2 = out.rc == D2SGPU_JOB_MMU_FAULT && out.reset_ok &&
+	    (out.fault_addr & ~0xfffull) == hole;
+	say("job 2 (fault): rc %llu fault %#llx @ %#llx reset %llu",
+	    (unsigned long long)out.rc, (unsigned long long)out.fault_status,
+	    (unsigned long long)out.fault_addr, (unsigned long long)out.reset_ok);
+
+	/* 3. and the next job works */
+	write_value_job(j, res.gpu_va, 0xD25C0003u);
+	d2sgpu_submit(conn, 0, job.gpu_va, 100000, &out);
+	int ok3 = out.rc == D2SGPU_JOB_DONE && r[0] == 0xD25C0003u;
+	say("job 3: rc %llu result %#x", (unsigned long long)out.rc, r[0]);
+
+	d2sgpu_buf_destroy(conn, &job);
+	d2sgpu_buf_destroy(conn, &res);
+	say("USER TEST %s (map+job %s, fault %s, after-fault %s)",
+	    ok1 && ok2 && ok3 ? "OK" : "FAIL", ok1 ? "ok" : "FAIL", ok2 ? "ok" : "FAIL",
+	    ok3 ? "ok" : "FAIL");
+	IOServiceClose(conn);
+	return ok1 && ok2 && ok3 ? 0 : 1;
+}

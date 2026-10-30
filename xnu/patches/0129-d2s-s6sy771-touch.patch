@@ -1,0 +1,127 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 3f15f09..eb86b77 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -649,6 +649,19 @@ a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
+ #define S8_I2C_CLKIN            26000000u
+ #define S8_I2C_SCL_HZ           400000u
+ 
++#if defined(D2S)
++/*
++ * S6SY771 (Samsung sec_ts y771_d): same commands as the S6SY761, but 16-byte
++ * events (struct sec_ts_event_coordinate). Bytes 0-3 hold eid/tid/state and
++ * the 12-bit x/y exactly as on the S6SY761; byte 7 bits 0-4 = left_event.
++ */
++#define S8TS_EVENT_SIZE         16
++#define S8TS_LEFT_MASK          0x1fu
++static uint32_t s8ts_scale = 1;          /* boot-arg d2sfb_scale, as AppleCLCD */
++#else
++#define S8TS_EVENT_SIZE         8
++#define S8TS_LEFT_MASK          0x3fu
++#endif
+ static vm_offset_t s8ts_i2c, s8ts_alive, s8bat_i2c;
+ static int s8ts_sleep;
+ static int s8ts_native;         /* sweetfb_native: iOS sees the whole panel */
+@@ -757,6 +770,26 @@ s8ts_report(const uint8_t *ev)
+ 	}
+ 	unsigned x = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
+ 	unsigned y = ((unsigned)ev[2] << 4) | (ev[3] & 0xf);
++#if defined(D2S)
++	/*
++	 * Raw 0..4095 covers the 1440x3040 panel. SweetHID takes 1080x1920 for
++	 * the whole iOS display; AppleCLCD maps that display onto the panel per
++	 * d2sfb_scale: 1 stretched over it, 2 1404 wide with 18 px bars, 0 1:1
++	 * centred.
++	 */
++	if (s8ts_native || s8ts_scale == 1) {
++		x = x * 1080 / 4096;
++		y = y * 1920 / 4096;
++	} else {
++		int lw = s8ts_scale == 2 ? 1404 : 1125, lh = s8ts_scale == 2 ? 3040 : 2436;
++		int px = (int)(x * 1440 / 4096) - (1440 - lw) / 2;
++		int py = (int)(y * 3040 / 4096) - (3040 - lh) / 2;
++		px = px < 0 ? 0 : (px > lw - 1 ? lw - 1 : px);
++		py = py < 0 ? 0 : (py > lh - 1 ? lh - 1 : py);
++		x = (unsigned)px * 1080 / (unsigned)lw;
++		y = (unsigned)py * 1920 / (unsigned)lh;
++	}
++#else
+ 	if (s8ts_native) {
+ 		x = x * 1080 / 4096;
+ 		y = y * 1920 / 4096;
+@@ -769,6 +802,7 @@ s8ts_report(const uint8_t *ev)
+ 		x = (unsigned)px * 1080 / 1125;
+ 		y = (unsigned)py * 1920 / 2436;
+ 	}
++#endif
+ 	if (state == 1 || state == 2) {             /* press, move */
+ 		if (!s8ts_down[tid]) {
+ 			printf("S8 TOUCH: down id=%u x=%u y=%u\n", tid, x, y);
+@@ -799,7 +833,7 @@ s8ts_wait(unsigned ms)
+ static void
+ s8ts_thread(void *arg, wait_result_t result)
+ {
+-	uint8_t buf[8 * 32];
++	uint8_t buf[S8TS_EVENT_SIZE * 32];
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
+@@ -810,16 +844,16 @@ s8ts_thread(void *arg, wait_result_t result)
+ 			s8ts_wait(8);
+ 			continue;
+ 		}
+-		if (!s8ts_cmd_read(0x60, buf, 8)) {         /* READ_ONE_EVENT */
++		if (!s8ts_cmd_read(0x60, buf, S8TS_EVENT_SIZE)) {  /* READ_ONE_EVENT */
+ 			if (++errors <= 8 || !(errors & 255)) {
+ 				printf("S8 TOUCH: event read failed (%u)\n", errors);
+ 			}
+ 			s8ts_wait(20);
+ 			continue;
+ 		}
+-		unsigned left = buf[7] & 0x3fu;
++		unsigned left = buf[7] & S8TS_LEFT_MASK;
+ 		if (buf[0] && left && left < 32 &&
+-		    !s8ts_cmd_read(0x61, buf + 8, left * 8)) {   /* READ_ALL_EVENT */
++		    !s8ts_cmd_read(0x61, buf + S8TS_EVENT_SIZE, left * S8TS_EVENT_SIZE)) {   /* READ_ALL_EVENT */
+ 			left = 0;
+ 		}
+ 		if (!buf[0]) {
+@@ -827,8 +861,8 @@ s8ts_thread(void *arg, wait_result_t result)
+ 			continue;
+ 		}
+ 		for (unsigned i = 0; i <= left; i++) {
+-			if (buf[i * 8]) {
+-				s8ts_report(buf + i * 8);
++			if (buf[i * S8TS_EVENT_SIZE]) {
++				s8ts_report(buf + i * S8TS_EVENT_SIZE);
+ 			}
+ 		}
+ 		errors = 0;
+@@ -907,7 +941,9 @@ dreamlte_touch_start(void)
+ 	}
+ 	s8i2c_reset(s8ts_i2c);
+ #if defined(D2S)
+-	/* S6SY771 reports a different boot status; only require the read. */
++	(void)PE_parse_boot_argn("d2sfb_scale", &s8ts_scale, sizeof(s8ts_scale));
++	/* sec_ts: 0x20 = application mode, 0x10 = boot loader. Report, do not
++	 * stop: the loader probe logs the same read before XNU. */
+ 	if (!s8ts_cmd_read(0x55, b, 1)) {                      /* BOOT_STATUS */
+ #else
+ 	if (!s8ts_cmd_read(0x55, b, 1) || b[0] != 0x20) {     /* BOOT_STATUS */
+@@ -915,9 +951,16 @@ dreamlte_touch_start(void)
+ 		printf("S8 TOUCH: no S6SY761 in application mode (status %#x)\n", b[0]);
+ 		return;
+ 	}
++#if defined(D2S)
++	printf("S8 TOUCH: S6SY771 boot status %#x (0x20 = app mode)\n", b[0]);
++	if (s8ts_cmd_read(0x52, b, 5)) {                       /* READ_ID */
++		printf("S8 TOUCH: S6SY771 id %02x %02x %02x %02x %02x\n", b[0], b[1], b[2], b[3], b[4]);
++	}
++#else
+ 	if (s8ts_cmd_read(0x52, b, 3)) {                       /* DEVICE_ID */
+ 		printf("S8 TOUCH: S6SY761 id %02x%02x%02x\n", b[0], b[1], b[2]);
+ 	}
++#endif
+ 	uint8_t func[3] = {0x30, 0x01, 0x00};                  /* TOUCH_FUNCTION = touch */
+ 	uint8_t sense = 0x10;                                   /* SENSE_ON */
+ 	if (!s8i2c_xfer(s8ts_i2c, S8TS_ADDR, func, 3, NULL, 0) ||

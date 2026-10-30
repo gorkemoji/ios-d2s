@@ -4,7 +4,14 @@
  * Controller: Samsung S6SY771 ("sec,sec_ts", reg <0x48>) on hsi2c_10 (0x104b0000)
  * Pins: gpp1-4 (SCL), gpp1-5 (SDA) on pinctrl_5@10430000 (function 2)
  * Interrupt: gpa1-0 on pinctrl_alive@15850000
- * USI block: 0x104b00c0
+ *
+ * hsi2c_10 is the USI port of USI03 in PERIC0 (DT clocks 0x1fd/0x1ed =
+ * DOUT_CLK_PERIC0_USI03_USI / GATE_USI03_USI). S-Boot leaves its clocks
+ * gated: the controller ignored writes and read 0 (boot log). Register
+ * addresses are from Samsung's exynos9820 cmucal-sfr.c, the USI v2 mode from
+ * usi_v2.c (usi_3 = usi@1042101c, "i2c" = 1 << 2), USI_CON from i2c-exynos5.c.
+ * As on the S8, the USI clock is taken from OSCCLK (26 MHz) so the HSI2C
+ * timing below and in the kernel (S8_I2C_CLKIN) holds.
  */
 #include <stdint.h>
 #define NULL ((void *)0)
@@ -20,9 +27,20 @@
 #define GPA1_DAT		(PINCTRL_ALIVE + 0x024)
 
 #define HSI2C_BASE		0x104b0000UL
-#define USI_CONFIG		(HSI2C_BASE + 0x0c0)
-#define USI_CON			(HSI2C_BASE + 0x0c4)
+#define USI_CON			(HSI2C_BASE + 0x0c4)	/* bit 0 = USI reset, active high */
 #define USI_OPTION		(HSI2C_BASE + 0x0c8)
+
+#define CMU_PERIC0		0x10400000UL
+#define USI03_USER_MUX		(CMU_PERIC0 + 0x01e0)	/* PLL_CON0: MUX_SEL bit 4, 0 = OSCCLK */
+#define USI03_DIV		(CMU_PERIC0 + 0x1810)	/* DIVRATIO bits 0-3 */
+#define GPIO_PERIC0_PCLK	(CMU_PERIC0 + 0x2018)
+#define RSTNSYNC_USI03		(CMU_PERIC0 + 0x2038)
+#define SYSREG_PERIC0_PCLK	(CMU_PERIC0 + 0x2058)
+#define USI03_IPCLK		(CMU_PERIC0 + 0x209c)
+#define USI03_PCLK		(CMU_PERIC0 + 0x20a0)
+#define GATE_ON			((1u << 21) | (1u << 20))	/* CG_VAL | MANUAL */
+#define SYSREG_USI03		0x1042101cUL		/* usi_3 SW_CONF */
+#define USI_V2_I2C		(1u << 2)
 
 #define CTL			0x00
 #define FIFO_CTL		0x04
@@ -185,6 +203,29 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	out = out_fn;
 	out("\n--- D2S TOUCH PROBE (S6SY771 on hsi2c_10 @ 0x104b0000) ---\n");
 
+	/* 0. Clocks: ungate USI03 (bus + IP clock, reset sync), GPIO and
+	 * SYSREG of PERIC0; USI03 from OSCCLK, divider 1; USI mode I2C. */
+	kv("pclk", rd(USI03_PCLK));
+	kv("ipclk", rd(USI03_IPCLK));
+	kv("mux", rd(USI03_USER_MUX));
+	kv("div", rd(USI03_DIV));
+	kv("sw_conf", rd(SYSREG_USI03));
+	out("\n");
+	wr(GPIO_PERIC0_PCLK, rd(GPIO_PERIC0_PCLK) | GATE_ON);
+	wr(SYSREG_PERIC0_PCLK, rd(SYSREG_PERIC0_PCLK) | GATE_ON);
+	wr(RSTNSYNC_USI03, rd(RSTNSYNC_USI03) | GATE_ON);
+	wr(USI03_PCLK, rd(USI03_PCLK) | GATE_ON);
+	wr(USI03_IPCLK, rd(USI03_IPCLK) | GATE_ON);
+	wr(USI03_USER_MUX, rd(USI03_USER_MUX) & ~(1u << 4));
+	wr(USI03_DIV, rd(USI03_DIV) & ~0xfu);
+	delay_ms(1);
+	wr(SYSREG_USI03, USI_V2_I2C);
+	kv("pclk", rd(USI03_PCLK));
+	kv("mux", rd(USI03_USER_MUX));
+	kv("div", rd(USI03_DIV));
+	kv("sw_conf", rd(SYSREG_USI03));
+	out("\n");
+
 	/* 1. Setup gpp1 pins: pin 4 (SCL) and pin 5 (SDA) -> Function 2 (hsi2c10_bus), no pull */
 	uint32_t gpp1_con = rd(GPP1_CON);
 	gpp1_con &= ~(0xffu << 16);
@@ -193,9 +234,9 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	wr(GPP1_PUD, rd(GPP1_PUD) & ~(0x0fu << 8));
 	kv("gpp1_con", rd(GPP1_CON));
 
-	/* 2. Setup USI block at 0x104b00c0 for I2C mode and release reset */
-	wr(USI_CONFIG, 0x1);
-	wr(USI_CON, rd(USI_CON) & ~1u);
+	/* 2. Release the USI reset (i2c-exynos5.c exynos_usi_init) */
+	kv("usi_con", rd(USI_CON));
+	wr(USI_CON, 0);
 	kv("usi_con", rd(USI_CON));
 
 	/* 3. Check GPA1-0 IRQ line level */
@@ -204,6 +245,8 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	/* 4. Reset HSI2C controller */
 	hsi2c_reset();
 	kv("hsi2c_ctl", hr(CTL));
+	kv("conf", hr(CONF));
+	out("\n");
 
 	/* 5. Probe Touch IC */
 	delay_ms(10);
@@ -211,9 +254,13 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	st = xfer(&c, 1, b, 1);
 	dump("boot_status", b, 1, st);
 
-	c = 0x52;	/* DEVICE_ID */
-	st = xfer(&c, 1, b, 3);
-	dump("device_id", b, 3, st);
+	c = 0x52;	/* READ_ID: Android reports 53 45 37 71 00 */
+	st = xfer(&c, 1, b, 5);
+	dump("device_id", b, 5, st);
+
+	c = 0xaf;	/* READ_TS_STATUS: Android reports 00 02 01 00 */
+	st = xfer(&c, 1, b, 4);
+	dump("ts_status", b, 4, st);
 
 	/* Send TOUCH_FUNCTION and SENSE_ON */
 	uint8_t func[3] = {0x30, 0x01, 0x00};

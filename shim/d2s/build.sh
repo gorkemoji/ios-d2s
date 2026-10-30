@@ -27,10 +27,11 @@ $CC $CFLAGS -c smp_probe.c -o out/smp_probe.o
 $CC $CFLAGS -c touch_probe.c -o out/touch_probe.o
 $CC $CFLAGS -c pmic.c -o out/pmic.o
 $CC $CFLAGS -c s2mps19.c -o out/s2mps19.o
+$CC $CFLAGS -c gpu_probe.c -o out/gpu_probe.o
 $CC $CFLAGS -c display_probe.c -o out/display_probe.o
 $CC $CFLAGS -c sd_probe.c -o out/sd_probe.o
 
-objs="out/loader.o out/fdt.o out/ufs_probe.o out/smp_probe.o out/touch_probe.o out/s2mps19.o out/pmic.o out/display_probe.o out/sd_probe.o"
+objs="out/loader.o out/fdt.o out/ufs_probe.o out/smp_probe.o out/touch_probe.o out/s2mps19.o out/gpu_probe.o out/pmic.o out/display_probe.o out/sd_probe.o"
 
 abs=$($READELF -r $objs | grep -c ABS64 || true)
 [ "$abs" = 0 ] || { echo "Hata: $abs absolute relocations tespit edildi" >&2; exit 1; }

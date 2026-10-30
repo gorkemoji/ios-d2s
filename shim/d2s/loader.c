@@ -21,6 +21,7 @@
 #include "pmic.h"
 #include "display_probe.h"
 #include "sd_probe.h"
+#include "gpu_probe.h"
 
 #define UFS_PROBE_DMA		0x8f0000000UL	/* high bank, outside XNU's window */
 
@@ -387,6 +388,7 @@ uint64_t dl_main(uintptr_t dtb, uint64_t el, uint64_t sctlr)
 	}
 	out("\n");
 	touch_probe(kv, out);
+	gpu_probe(kv, out);
 	/* smp_probe(kv, out);  core-start test, see smp_probe.c */
 	clean(ba_pa, ba_pa + PAGE_SIZE);
 	fg = 0xff40ff40U;

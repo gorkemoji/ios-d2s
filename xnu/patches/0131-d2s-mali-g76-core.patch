@@ -33,10 +33,10 @@ index 6cc1fd9..28b589c 100644
  	int log_contacts = 0;
 diff --git a/bsd/dev/d2s_gpu.c b/bsd/dev/d2s_gpu.c
 new file mode 100644
-index 0000000..328a3d4
+index 0000000..9daad7c
 --- /dev/null
 +++ b/bsd/dev/d2s_gpu.c
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,586 @@
 +/*
 + * Galaxy Note 10+ (d2s, Exynos 9825): Mali-G76 MP12 kernel driver core.
 + *
@@ -495,9 +495,11 @@ index 0000000..328a3d4
 +log_result(const char *what, int rc, const struct d2s_gpu_result *r)
 +{
 +	printf("D2S GPU: %s rc %d in %u us: job raw %#x js status %#x head %#llx "
-+	    "mmu raw %#x fault %#x @ %#llx%s\n", what, rc, r->us, r->job_rawstat,
-+	    r->js_status, r->js_head, r->mmu_rawstat, r->fault_status, r->fault_addr,
-+	    rc == D2S_GPU_JOB_DONE ? "" : (r->reset_ok ? ", GPU reset OK" : ", GPU RESET FAILED"));
++	    "mmu raw %#x fault %#x (type %#x access %u) @ %#llx%s\n", what, rc, r->us,
++	    r->job_rawstat, r->js_status, r->js_head, r->mmu_rawstat, r->fault_status,
++	    r->fault_status & 0xff, (r->fault_status >> 8) & 3, r->fault_addr,
++	    rc == D2S_GPU_JOB_DONE || rc == D2S_GPU_JOB_INVALID ? "" :
++	    (r->reset_ok ? ", GPU reset OK" : ", GPU RESET FAILED"));
 +}
 +
 +static void
@@ -512,9 +514,10 @@ index 0000000..328a3d4
 +		printf("D2S GPU: self-test: no memory\n");
 +		return;
 +	}
-+	/* page 0: jobs (exec), pages 1-2: results; the gap below gva+3 pages
-+	 * stays unmapped for the fault test */
-+	if (!d2s_gpu_map(&c, gva, buf.pa, GPAGE, D2S_GPU_MAP_EXEC) ||
++	/* page 0: jobs, pages 2-3: results; gva + 1 page stays unmapped for the
++	 * fault test. Job pages must be writable: the GPU writes the job status
++	 * back into the header (boot 1 faulted there: 0xc8, write access). */
++	if (!d2s_gpu_map(&c, gva, buf.pa, GPAGE, D2S_GPU_MAP_WRITE) ||
 +	    !d2s_gpu_map(&c, gva + 2 * GPAGE, buf.pa + GPAGE, 2 * GPAGE, D2S_GPU_MAP_WRITE) ||
 +	    !d2s_gpu_ctx_bind(&c)) {
 +		printf("D2S GPU: self-test: map/bind failed\n");
@@ -538,10 +541,12 @@ index 0000000..328a3d4
 +	bool chain_ok = rc == D2S_GPU_JOB_DONE && res[0] == 0xD25A0001u &&
 +	    res[(GPAGE + 0x40) / 4] == 0xD25A0002u;
 +
-+	/* 2. a write to an unmapped page must fault, and the GPU recover */
++	/* 2. a write to an unmapped page must fault, and the GPU recover.
++	 * A failed test 1 left the context unbound; bind it again first. */
 +	write_value_job(&jobs[0], 1, 0, 0, gva + GPAGE, 0xBAD);
 +	d2s_gpu_sync(buf.pa, GPAGE, true);
-+	rc = d2s_gpu_run(&c, 0, gva, 100000, &r);
++	rc = c.bound || d2s_gpu_ctx_bind(&c) ?
++	    d2s_gpu_run(&c, 0, gva, 100000, &r) : D2S_GPU_JOB_INVALID;
 +	log_result("fault test", rc, &r);
 +	bool fault_ok = rc == D2S_GPU_JOB_MMU_FAULT && r.reset_ok &&
 +	    (r.fault_addr & ~0xfffull) == gva + GPAGE;

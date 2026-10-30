@@ -71,6 +71,57 @@
 #define CMD_SOFT_RESET		0x01
 #define IRQ_RESET_COMPLETED	(1u << 8)
 
+/* Job manager and MMU (panfrost_regs.h) */
+#define JOB_INT_RAWSTAT		0x1000
+#define JOB_INT_CLEAR		0x1004
+#define JOB_INT_MASK		0x1008
+#define JS0			0x1800
+#define JS_HEAD_LO		0x00
+#define JS_HEAD_HI		0x04
+#define JS_STATUS		0x24
+#define JS_HEAD_NEXT_LO		0x40
+#define JS_HEAD_NEXT_HI		0x44
+#define JS_AFFINITY_NEXT_LO	0x50
+#define JS_AFFINITY_NEXT_HI	0x54
+#define JS_CONFIG_NEXT		0x58
+#define JS_COMMAND_NEXT		0x60
+#define JS_CFG_START_FLUSH_CI	(3u << 8)
+#define JS_CFG_END_FLUSH_CI	(3u << 12)
+#define JS_CFG_THREAD_PRI(n)	((n) << 16)
+#define JS_CMD_START		1
+#define MMU_INT_RAWSTAT		0x2000
+#define MMU_INT_CLEAR		0x2004
+#define MMU_INT_MASK		0x2008
+#define AS0			0x2400
+#define AS_TRANSTAB_LO		0x00
+#define AS_TRANSTAB_HI		0x04
+#define AS_MEMATTR_LO		0x08
+#define AS_MEMATTR_HI		0x0c
+#define AS_COMMAND		0x18
+#define AS_FAULTSTATUS		0x1c
+#define AS_FAULTADDR_LO		0x20
+#define AS_FAULTADDR_HI		0x24
+#define AS_STATUS		0x28
+#define AS_CMD_UPDATE		1
+#define AS_ACTIVE		1
+
+/*
+ * Mali LPAE page tables (io-pgtable-arm.c, ARM_MALI_LPAE): always 4 levels
+ * of 4 KiB tables; table entries type 3; leaves type 1 (also at level 3);
+ * permissions stage-2 style (bit 6 read, bit 7 write); attribute index 0
+ * (MEMATTR 0x88, the "implementation defined" policy panfrost uses);
+ * outer shareable. TRANSTAB = table | READ_INNER | ADRMODE_TABLE.
+ */
+#define PTE_TABLE		3ull
+#define PTE_BLOCK		1ull
+#define PTE_RW			((1ull << 6) | (1ull << 7))
+#define PTE_SH_OS		(2ull << 8)
+#define TRANSTAB_FLAGS		((1u << 2) | 3u)
+#define MEMATTR_LO		(0x88u | 0x8du << 8 | 0x88u << 16)
+
+/* L0, L1, L2 tables and one data page, identity mapped (MMU off: VA = PA) */
+static uint64_t gpu_mem[4][512] __attribute__((aligned(4096)));
+
 #define TIMER_HZ		26000000UL
 
 static void (*kv)(const char *, uint64_t);
@@ -172,6 +223,114 @@ static uint32_t cores(unsigned pwr, unsigned ready, uint32_t mask, int on)
 	return gr(ready);
 }
 
+static int as_wait(void)
+{
+	uint64_t end = ticks() + TIMER_HZ / 10;
+	while (gr(AS0 + AS_STATUS) & AS_ACTIVE)
+		if (ticks() > end)
+			return -1;
+	return 0;
+}
+
+/*
+ * GPU step 2: one WRITE_VALUE job (job type 2, genxml v7) through address
+ * space 0 on job slot 0. The job manager stores a 32-bit immediate at a
+ * GPU virtual address; success means the MMU walk, the job descriptor read
+ * and the memory write all work.
+ */
+static void first_job(uint64_t shaders)
+{
+	uint64_t *l0 = gpu_mem[0], *l1 = gpu_mem[1], *l2 = gpu_mem[2];
+	volatile uint32_t *data = (volatile uint32_t *)gpu_mem[3];
+	uint64_t va = (uintptr_t)gpu_mem[3];	/* identity map: VA = PA */
+	uint64_t job_va = va, result_va = va + 0x100;
+
+	out("GPU JOB: write-value test\n");
+	for (unsigned t = 0; t < 4; t++)
+		for (unsigned i = 0; i < 512; i++)
+			gpu_mem[t][i] = 0;
+	l0[(va >> 39) & 0x1ff] = (uintptr_t)l1 | PTE_TABLE;
+	l1[(va >> 30) & 0x1ff] = (uintptr_t)l2 | PTE_TABLE;
+	l2[(va >> 21) & 0x1ff] = (va & ~0x1fffffull) | PTE_BLOCK | PTE_RW | PTE_SH_OS;
+
+	/* Write Value Job: header (32 bytes) + payload */
+	data[4] = 1u | 2u << 1 | 1u << 16;	/* is64b, type 2, index 1 */
+	data[8] = (uint32_t)result_va;
+	data[9] = (uint32_t)(result_va >> 32);
+	data[10] = 6;				/* Immediate 32 */
+	data[12] = 0xD25600D5u;
+	data[13] = 0;
+	data[0x100 / 4] = 0x11111111u;		/* result, overwritten by the GPU */
+	__asm__ volatile("dsb sy" ::: "memory");
+	kv("buf", va);
+	kv("l0", (uintptr_t)l0);
+	out("\n");
+
+	/* address space 0 (panfrost_mmu_enable) */
+	gw(MMU_INT_MASK, 0);
+	gw(MMU_INT_CLEAR, 0xffffffffu);
+	if (as_wait()) {
+		out("GPU JOB: AS0 busy before setup\n");
+		return;
+	}
+	uint64_t tt = (uintptr_t)l0 | TRANSTAB_FLAGS;
+	gw(AS0 + AS_TRANSTAB_LO, (uint32_t)tt);
+	gw(AS0 + AS_TRANSTAB_HI, (uint32_t)(tt >> 32));
+	gw(AS0 + AS_MEMATTR_LO, MEMATTR_LO);
+	gw(AS0 + AS_MEMATTR_HI, 0);
+	gw(AS0 + AS_COMMAND, AS_CMD_UPDATE);
+	kv("as update", (uint64_t)(uint32_t)as_wait());
+	kv("as status", gr(AS0 + AS_STATUS));
+	out("\n");
+
+	/* submit on slot 0 (panfrost_job_hw_submit) */
+	gw(JOB_INT_MASK, 0);
+	gw(JOB_INT_CLEAR, 0xffffffffu);
+	gw(JS0 + JS_HEAD_NEXT_LO, (uint32_t)job_va);
+	gw(JS0 + JS_HEAD_NEXT_HI, (uint32_t)(job_va >> 32));
+	gw(JS0 + JS_AFFINITY_NEXT_LO, (uint32_t)shaders);
+	gw(JS0 + JS_AFFINITY_NEXT_HI, (uint32_t)(shaders >> 32));
+	gw(JS0 + JS_CONFIG_NEXT, 0 /* AS 0 */ | JS_CFG_THREAD_PRI(8) |
+	   JS_CFG_START_FLUSH_CI | JS_CFG_END_FLUSH_CI);
+	uint64_t t0 = ticks();
+	gw(JS0 + JS_COMMAND_NEXT, JS_CMD_START);
+
+	uint64_t end = t0 + TIMER_HZ / 10;
+	uint32_t raw;
+	while (!((raw = gr(JOB_INT_RAWSTAT)) & 0x10001u) && ticks() < end)
+		;
+	kv("job rawstat", raw);
+	kv("us", (ticks() - t0) / (TIMER_HZ / 1000000));
+	kv("js status", gr(JS0 + JS_STATUS));
+	kv("js head", (uint64_t)gr(JS0 + JS_HEAD_HI) << 32 | gr(JS0 + JS_HEAD_LO));
+	out("\n");
+	kv("mmu rawstat", gr(MMU_INT_RAWSTAT));
+	kv("fault", gr(AS0 + AS_FAULTSTATUS));
+	kv("addr", (uint64_t)gr(AS0 + AS_FAULTADDR_HI) << 32 | gr(AS0 + AS_FAULTADDR_LO));
+	out("\n");
+	kv("hdr exception", data[0]);
+	kv("result", data[0x100 / 4]);
+	out("\n");
+	gw(JOB_INT_CLEAR, 0xffffffffu);
+	gw(MMU_INT_CLEAR, 0xffffffffu);
+
+	if (data[0x100 / 4] == 0xD25600D5u)
+		out("GPU JOB: OK, the GPU wrote 0xd25600d5 through its MMU\n");
+	else if (raw & 0x10000u)
+		out("GPU JOB: job slot 0 reported an error\n");
+	else if (!(raw & 1u))
+		out("GPU JOB: no completion within 100 ms\n");
+	else
+		out("GPU JOB: completed but the value is wrong\n");
+
+	/* leave address space 0 unconfigured again */
+	gw(AS0 + AS_TRANSTAB_LO, 0);
+	gw(AS0 + AS_TRANSTAB_HI, 0);
+	gw(AS0 + AS_MEMATTR_LO, 0);
+	gw(AS0 + AS_COMMAND, AS_CMD_UPDATE);
+	as_wait();
+}
+
 void gpu_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const char *))
 {
 	kv = kv_fn;
@@ -255,6 +414,8 @@ void gpu_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const char 
 		  (gr(TILER_READY) & ti) == ti;
 	out(all ? "GPU: L2, tiler and all shader cores powered\n"
 		: "GPU: some cores did not report ready\n");
+	if (all)
+		first_job((uint64_t)gr(SHADER_PRESENT + 4) << 32 | sh);
 	kv("shader off", cores(SHADER_PWROFF, SHADER_READY, sh, 0));
 	kv("tiler off", cores(TILER_PWROFF, TILER_READY, ti, 0));
 	kv("l2 off", cores(L2_PWROFF, L2_READY, l2, 0));

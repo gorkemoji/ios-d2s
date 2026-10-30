@@ -32,7 +32,7 @@ index 28b589c..d407ec8 100644
  	int log_contacts = 0;
 diff --git a/bsd/kern/d2s_files.c b/bsd/kern/d2s_files.c
 new file mode 100644
-index 0000000..e9f3dc9
+index 0000000..1f1103e
 --- /dev/null
 +++ b/bsd/kern/d2s_files.c
 @@ -0,0 +1,201 @@
@@ -61,6 +61,7 @@ index 0000000..e9f3dc9
 +#include <sys/fcntl.h>
 +#include <sys/mount.h>
 +#include <sys/vnode.h>
++#include <sys/vnode_internal.h>	/* vnode_setsize, rootvnode */
 +#include <sys/kauth.h>
 +#include <sys/proc.h>
 +#include <kern/thread.h>
@@ -73,7 +74,6 @@ index 0000000..e9f3dc9
 +bool d2s_files_wait(uint32_t ms);
 +
 +#if defined(D2S)
-+extern struct vnode *rootvnode;
 +extern void IOSleep(unsigned int milliseconds);
 +
 +#define OP_WRITE		1

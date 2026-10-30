@@ -1,0 +1,685 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 851addd..ed8b66e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
++bsd/dev/d2s_gpu.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 6cc1fd9..28b589c 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1079,11 +1079,16 @@ dreamlte_touch_start(void)
+ }
+ #endif /* DREAMLTE */
+ 
++extern void d2s_gpu_start(void);
++
+ void
+ a5xelte_touch_probe(void)
+ {
+ #if defined(DREAMLTE)
+ 	dreamlte_touch_start();   /* the A5 path below stays off */
++#endif
++#if defined(D2S)
++	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
+ #endif
+ 	int enabled = A5_TOUCH_DEFAULT; /* A5 touch: off on the S8 */
+ 	int log_contacts = 0;
+diff --git a/bsd/dev/d2s_gpu.c b/bsd/dev/d2s_gpu.c
+new file mode 100644
+index 0000000..400111f
+--- /dev/null
++++ b/bsd/dev/d2s_gpu.c
+@@ -0,0 +1,577 @@
++/*
++ * Galaxy Note 10+ (d2s, Exynos 9825): Mali-G76 MP12 kernel driver core.
++ *
++ * GPU step 3a. The pieces Mesa's Panfrost/PanVK need underneath, without
++ * the user-space interface yet (step 3b):
++ *  - bring-up: soft reset, L2/tiler/shader power (the power domain is left
++ *    on by S-Boot; the loader's gpu_probe.c logs it)
++ *  - GPU memory: one physically contiguous pool, 4 KiB sub-allocated
++ *  - GPU virtual memory: per-context Mali LPAE page tables (4 levels,
++ *    4 KiB leaves) at any GPU address, loaded into a hardware address space
++ *  - job chains on a job slot, polled completion, job and MMU fault report,
++ *    recovery by soft reset
++ *  - a boot self-test through exactly these functions (boot-arg d2sgpu,
++ *    default 1; 0 = skip)
++ *
++ * Register and page-table formats: Linux panfrost (panfrost_regs.h,
++ * panfrost_mmu.c, panfrost_job.c) and io-pgtable-arm.c ARM_MALI_LPAE; job
++ * descriptors: Mesa genxml v7. Verified in the loader first (shim/d2s,
++ * GPU steps 1 and 2).
++ *
++ * Interrupts are not routed yet: completion is polled, as the touch driver
++ * does. The GPU does not snoop CPU caches: descriptors and page tables are
++ * cleaned to memory before a job, results invalidated after.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++#include <libkern/libkern.h>
++
++void d2s_gpu_start(void);
++
++#if defined(D2S)
++#include "d2s_gpu.h"
++
++#define GPU_PA			0x18500000ull
++#define GPU_SIZE		0x5000
++#define PMU_PA			0x15862000ull	/* EMBEDDED_G3D_STATUS at +0x104 */
++
++/* GPU control */
++#define GPU_ID			0x000
++#define MMU_FEATURES		0x014
++#define AS_PRESENT		0x018
++#define JS_PRESENT		0x01c
++#define GPU_IRQ_RAWSTAT		0x020
++#define GPU_IRQ_CLEAR		0x024
++#define GPU_IRQ_MASK		0x028
++#define GPU_COMMAND		0x030
++#define GPU_STATUS		0x034
++#define GPU_FAULTSTATUS		0x03c
++#define SHADER_PRESENT		0x100
++#define TILER_PRESENT		0x110
++#define L2_PRESENT		0x120
++#define SHADER_READY		0x140
++#define TILER_READY		0x150
++#define L2_READY		0x160
++#define SHADER_PWRON		0x180
++#define TILER_PWRON		0x190
++#define L2_PWRON		0x1a0
++#define CMD_SOFT_RESET		0x01
++#define CMD_CLEAN_INV_CACHES	0x08
++#define IRQ_RESET_COMPLETED	(1u << 8)
++#define IRQ_CLEAN_CACHES_DONE	(1u << 17)
++
++/* job manager */
++#define JOB_INT_RAWSTAT		0x1000
++#define JOB_INT_CLEAR		0x1004
++#define JOB_INT_MASK		0x1008
++#define JS(n)			(0x1800 + (n) * 0x80)
++#define JS_HEAD_LO		0x00
++#define JS_HEAD_HI		0x04
++#define JS_STATUS		0x24
++#define JS_HEAD_NEXT_LO		0x40
++#define JS_HEAD_NEXT_HI		0x44
++#define JS_AFFINITY_NEXT_LO	0x50
++#define JS_AFFINITY_NEXT_HI	0x54
++#define JS_CONFIG_NEXT		0x58
++#define JS_COMMAND_NEXT		0x60
++#define JS_CFG_START_FLUSH_CI	(3u << 8)
++#define JS_CFG_END_FLUSH_CI	(3u << 12)
++#define JS_CFG_THREAD_PRI(n)	((n) << 16)
++#define JS_CMD_START		1
++#define JS_CMD_HARD_STOP	3
++
++/* MMU */
++#define MMU_INT_RAWSTAT		0x2000
++#define MMU_INT_CLEAR		0x2004
++#define MMU_INT_MASK		0x2008
++#define AS(n)			(0x2400 + (n) * 0x40)
++#define AS_TRANSTAB_LO		0x00
++#define AS_TRANSTAB_HI		0x04
++#define AS_MEMATTR_LO		0x08
++#define AS_MEMATTR_HI		0x0c
++#define AS_LOCKADDR_LO		0x10
++#define AS_LOCKADDR_HI		0x14
++#define AS_COMMAND		0x18
++#define AS_FAULTSTATUS		0x1c
++#define AS_FAULTADDR_LO		0x20
++#define AS_FAULTADDR_HI		0x24
++#define AS_STATUS		0x28
++#define AS_CMD_UPDATE		1
++#define AS_CMD_LOCK		2
++#define AS_CMD_FLUSH_PT		4
++#define AS_CMD_FLUSH_MEM	5
++#define AS_ACTIVE		1
++
++/* Mali LPAE (io-pgtable-arm.c ARM_MALI_LPAE) */
++#define PTE_TABLE		3ull
++#define PTE_LEAF		1ull		/* type "block", also at level 3 */
++#define PTE_READ		(1ull << 6)
++#define PTE_WRITE		(1ull << 7)
++#define PTE_SH_OS		(2ull << 8)
++#define PTE_XN			(1ull << 54)
++#define PTE_ADDR		0x000ffffffffff000ull
++#define TRANSTAB_FLAGS		((1u << 2) | 3u)	/* READ_INNER | ADRMODE_TABLE */
++#define MEMATTR			(0x88u | 0x8du << 8 | 0x88u << 16)
++
++#define POOL_SIZE		(8u << 20)	/* contiguous GPU memory for step 3a */
++#define GPAGE			4096u
++
++static vm_offset_t gpu;			/* MMIO */
++static struct d2s_gpu_info info;
++static vm_offset_t pool_va;
++static uint64_t pool_pa;
++static uint32_t pool_used;
++static lck_grp_t *gpu_lck_grp;
++static lck_mtx_t *gpu_lock;
++static bool gpu_ready;
++
++static inline uint32_t gr(uint32_t o) { return *(volatile uint32_t *)(gpu + o); }
++static inline void gw(uint32_t o, uint32_t v) { *(volatile uint32_t *)(gpu + o) = v; }
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000;
++}
++
++/* Poll (reg & mask) == val for up to us microseconds. */
++static bool
++gwait(uint32_t reg, uint32_t mask, uint32_t val, uint32_t us)
++{
++	uint64_t end = now_us() + us;
++	do {
++		if ((gr(reg) & mask) == val) {
++			return true;
++		}
++	} while (now_us() < end);
++	return false;
++}
++
++/* ---- GPU memory ------------------------------------------------------ */
++
++/* Clean (CPU -> memory) or invalidate (memory -> CPU) a range by PA. */
++void
++d2s_gpu_sync(uint64_t pa, uint32_t len, bool to_gpu)
++{
++	if (to_gpu) {
++		clean_dcache64((addr64_t)pa, len, TRUE);
++	} else {
++		flush_dcache64((addr64_t)pa, len, TRUE);
++	}
++}
++
++/* Zeroed, 4 KiB aligned block of the pool; caller holds gpu_lock. Never
++ * freed in step 3a (step 3b replaces the pool with per-buffer memory). */
++static bool
++pool_alloc_locked(uint32_t size, struct d2s_gpu_mem *m)
++{
++	size = (size + GPAGE - 1) & ~(GPAGE - 1);
++	if (!pool_va || size > POOL_SIZE - pool_used) {
++		return false;
++	}
++	m->va = pool_va + pool_used;
++	m->pa = pool_pa + pool_used;
++	m->size = size;
++	pool_used += size;
++	bzero((void *)m->va, size);
++	d2s_gpu_sync(m->pa, size, true);
++	return true;
++}
++
++bool
++d2s_gpu_alloc(uint32_t size, struct d2s_gpu_mem *m)
++{
++	lck_mtx_lock(gpu_lock);
++	bool ok = pool_alloc_locked(size, m);
++	lck_mtx_unlock(gpu_lock);
++	return ok;
++}
++
++static void *
++pa_to_va(uint64_t pa)
++{
++	return (void *)(pool_va + (pa - pool_pa));
++}
++
++static uint64_t
++va_to_pa(const void *va)
++{
++	return pool_pa + ((vm_offset_t)va - pool_va);
++}
++
++/* ---- GPU virtual memory ---------------------------------------------- */
++
++bool
++d2s_gpu_ctx_init(struct d2s_gpu_ctx *c, int as)
++{
++	bzero(c, sizeof(*c));
++	c->as = as;
++	if (as < 0 || as >= 8 || !(info.as_present & (1u << as))) {
++		return false;
++	}
++	return d2s_gpu_alloc(GPAGE, &c->l0);
++}
++
++/* Walk to the level-3 table for va, allocating tables on the way. */
++static uint64_t *
++l3_table(struct d2s_gpu_ctx *c, uint64_t va)
++{
++	uint64_t *t = (uint64_t *)c->l0.va;
++	for (int lvl = 0; lvl < 3; lvl++) {
++		unsigned idx = (va >> (39 - 9 * lvl)) & 0x1ff;
++		uint64_t e = t[idx];
++		if ((e & 3) != PTE_TABLE) {
++			struct d2s_gpu_mem m;
++			if (!pool_alloc_locked(GPAGE, &m)) {
++				return NULL;
++			}
++			e = m.pa | PTE_TABLE;
++			t[idx] = e;
++			d2s_gpu_sync(va_to_pa(&t[idx]), 8, true);
++		}
++		t = pa_to_va(e & PTE_ADDR);
++	}
++	return t;
++}
++
++/* MMU operation on a locked region (panfrost mmu_hw_do_operation). */
++static bool
++as_op(int as, uint64_t va, uint64_t size, uint32_t op)
++{
++	if (!gwait(AS(as) + AS_STATUS, AS_ACTIVE, 0, 100000)) {
++		return false;
++	}
++	if (size) {
++		/* panfrost lock_region: naturally aligned power of two, encoded
++		 * as log2(size) - 1, at least AS_LOCK_REGION_MIN_SIZE (32 KiB) */
++		uint64_t diff = va ^ (va + size - 1);
++		int width = diff ? 64 - __builtin_clzll(diff) : 0;	/* fls64 */
++		if (width < 15) {
++			width = 15;
++		}
++		width -= 1;
++		uint64_t region = (va & ~((1ull << width) - 1)) | (uint64_t)width;
++		gw(AS(as) + AS_LOCKADDR_LO, (uint32_t)region);
++		gw(AS(as) + AS_LOCKADDR_HI, (uint32_t)(region >> 32));
++		gw(AS(as) + AS_COMMAND, AS_CMD_LOCK);
++		if (!gwait(AS(as) + AS_STATUS, AS_ACTIVE, 0, 100000)) {
++			return false;
++		}
++	}
++	gw(AS(as) + AS_COMMAND, op);
++	return gwait(AS(as) + AS_STATUS, AS_ACTIVE, 0, 100000);
++}
++
++/* Map [va, va+size) to [pa, pa+size); flags D2S_GPU_MAP_*. */
++bool
++d2s_gpu_map(struct d2s_gpu_ctx *c, uint64_t va, uint64_t pa, uint64_t size, uint32_t flags)
++{
++	uint64_t attr = PTE_LEAF | PTE_READ | PTE_SH_OS;
++	if (flags & D2S_GPU_MAP_WRITE) {
++		attr |= PTE_WRITE;
++	}
++	if (!(flags & D2S_GPU_MAP_EXEC)) {
++		attr |= PTE_XN;
++	}
++	if ((va | pa | size) & (GPAGE - 1)) {
++		return false;
++	}
++	lck_mtx_lock(gpu_lock);
++	for (uint64_t off = 0; off < size; off += GPAGE) {
++		uint64_t *t = l3_table(c, va + off);
++		if (!t) {
++			lck_mtx_unlock(gpu_lock);
++			return false;
++		}
++		unsigned idx = ((va + off) >> 12) & 0x1ff;
++		t[idx] = (pa + off) | attr;
++		d2s_gpu_sync(va_to_pa(&t[idx]), 8, true);
++	}
++	bool ok = true;
++	if (c->bound) {
++		ok = as_op(c->as, va, size, AS_CMD_FLUSH_PT);
++	}
++	lck_mtx_unlock(gpu_lock);
++	return ok;
++}
++
++/* Load the context's tables into its hardware address space. */
++bool
++d2s_gpu_ctx_bind(struct d2s_gpu_ctx *c)
++{
++	uint64_t tt = c->l0.pa | TRANSTAB_FLAGS;
++	lck_mtx_lock(gpu_lock);
++	bool ok = as_op(c->as, 0, 0, AS_CMD_FLUSH_MEM);
++	gw(AS(c->as) + AS_TRANSTAB_LO, (uint32_t)tt);
++	gw(AS(c->as) + AS_TRANSTAB_HI, (uint32_t)(tt >> 32));
++	gw(AS(c->as) + AS_MEMATTR_LO, MEMATTR);
++	gw(AS(c->as) + AS_MEMATTR_HI, 0);
++	ok = ok && as_op(c->as, 0, 0, AS_CMD_UPDATE);
++	c->bound = ok;
++	lck_mtx_unlock(gpu_lock);
++	return ok;
++}
++
++/* ---- bring-up and recovery ------------------------------------------- */
++
++static bool
++power_cores(void)
++{
++	gw(L2_PWRON, info.l2_present);
++	gw(L2_PWRON + 4, 0);
++	if (!gwait(L2_READY, info.l2_present, info.l2_present, 20000)) {
++		return false;
++	}
++	gw(TILER_PWRON, info.tiler_present);
++	gw(TILER_PWRON + 4, 0);
++	gw(SHADER_PWRON, (uint32_t)info.shader_present);
++	gw(SHADER_PWRON + 4, (uint32_t)(info.shader_present >> 32));
++	return gwait(TILER_READY, info.tiler_present, info.tiler_present, 20000) &&
++	       gwait(SHADER_READY, (uint32_t)info.shader_present,
++	    (uint32_t)info.shader_present, 20000);
++}
++
++/* Soft reset, then cores back on; address spaces must be bound again. */
++static bool
++gpu_reset(void)
++{
++	gw(GPU_IRQ_MASK, 0);
++	gw(JOB_INT_MASK, 0);
++	gw(MMU_INT_MASK, 0);
++	gw(GPU_IRQ_CLEAR, 0xffffffffu);
++	gw(GPU_COMMAND, CMD_SOFT_RESET);
++	if (!gwait(GPU_IRQ_RAWSTAT, IRQ_RESET_COMPLETED, IRQ_RESET_COMPLETED, 100000)) {
++		return false;
++	}
++	gw(GPU_IRQ_CLEAR, 0xffffffffu);
++	gw(JOB_INT_CLEAR, 0xffffffffu);
++	gw(MMU_INT_CLEAR, 0xffffffffu);
++	return power_cores();
++}
++
++/* ---- jobs ------------------------------------------------------------ */
++
++/*
++ * Run a job chain starting at GPU address head on slot js in the context's
++ * address space and wait up to timeout_us. Returns D2S_GPU_JOB_*; r gets
++ * the status registers. A fault or timeout resets the GPU, which unbinds
++ * every context.
++ */
++int
++d2s_gpu_run(struct d2s_gpu_ctx *c, int js, uint64_t head, uint32_t timeout_us,
++    struct d2s_gpu_result *r)
++{
++	bzero(r, sizeof(*r));
++	if (!gpu_ready || !c->bound || js < 0 || js > 2 || !(info.js_present & (1u << js))) {
++		return D2S_GPU_JOB_INVALID;
++	}
++	lck_mtx_lock(gpu_lock);
++	uint32_t done = 1u << js, err = 1u << (js + 16);
++	gw(JOB_INT_CLEAR, done | err);
++	gw(MMU_INT_CLEAR, 1u << c->as | 1u << (c->as + 16));
++	gw(JS(js) + JS_HEAD_NEXT_LO, (uint32_t)head);
++	gw(JS(js) + JS_HEAD_NEXT_HI, (uint32_t)(head >> 32));
++	gw(JS(js) + JS_AFFINITY_NEXT_LO, (uint32_t)info.shader_present);
++	gw(JS(js) + JS_AFFINITY_NEXT_HI, (uint32_t)(info.shader_present >> 32));
++	gw(JS(js) + JS_CONFIG_NEXT, (uint32_t)c->as | JS_CFG_THREAD_PRI(8) |
++	    JS_CFG_START_FLUSH_CI | JS_CFG_END_FLUSH_CI);
++	uint64_t t0 = now_us();
++	gw(JS(js) + JS_COMMAND_NEXT, JS_CMD_START);
++
++	int rc = D2S_GPU_JOB_TIMEOUT;
++	uint32_t raw = 0, mmu = 0;
++	do {
++		raw = gr(JOB_INT_RAWSTAT);
++		mmu = gr(MMU_INT_RAWSTAT);
++		if (mmu & (1u << c->as | 1u << (c->as + 16))) {
++			rc = D2S_GPU_JOB_MMU_FAULT;
++			break;
++		}
++		if (raw & err) {
++			rc = D2S_GPU_JOB_ERROR;
++			break;
++		}
++		if (raw & done) {
++			rc = D2S_GPU_JOB_DONE;
++			break;
++		}
++	} while (now_us() - t0 < timeout_us);
++	r->us = (uint32_t)(now_us() - t0);
++	r->job_rawstat = raw;
++	r->js_status = gr(JS(js) + JS_STATUS);
++	r->js_head = (uint64_t)gr(JS(js) + JS_HEAD_HI) << 32 | gr(JS(js) + JS_HEAD_LO);
++	r->mmu_rawstat = mmu;
++	r->fault_status = gr(AS(c->as) + AS_FAULTSTATUS);
++	r->fault_addr = (uint64_t)gr(AS(c->as) + AS_FAULTADDR_HI) << 32 | gr(AS(c->as) + AS_FAULTADDR_LO);
++	gw(JOB_INT_CLEAR, done | err);
++	if (rc != D2S_GPU_JOB_DONE) {
++		gw(JS(js) + JS_COMMAND_NEXT, 0);
++		gw(JS(js) + 0x20 /* JS_COMMAND */, JS_CMD_HARD_STOP);
++		r->reset_ok = gpu_reset();
++		c->bound = false;
++	}
++	lck_mtx_unlock(gpu_lock);
++	return rc;
++}
++
++const struct d2s_gpu_info *
++d2s_gpu_get_info(void)
++{
++	return gpu_ready ? &info : NULL;
++}
++
++/* ---- boot self-test -------------------------------------------------- */
++
++/* genxml v7 Write Value Job: header 32 bytes + payload; 64 bytes each here */
++static void
++write_value_job(uint32_t *j, uint16_t index, uint16_t dep, uint64_t next,
++    uint64_t dst, uint32_t value)
++{
++	bzero(j, 64);
++	j[4] = 1u | 2u << 1 | (uint32_t)index << 16;	/* is64b, type 2 */
++	j[5] = dep;
++	j[6] = (uint32_t)next;
++	j[7] = (uint32_t)(next >> 32);
++	j[8] = (uint32_t)dst;
++	j[9] = (uint32_t)(dst >> 32);
++	j[10] = 6;					/* Immediate 32 */
++	j[12] = value;
++}
++
++static void
++log_result(const char *what, int rc, const struct d2s_gpu_result *r)
++{
++	printf("D2S GPU: %s rc %d in %u us: job raw %#x js status %#x head %#llx "
++	    "mmu raw %#x fault %#x @ %#llx%s\n", what, rc, r->us, r->job_rawstat,
++	    r->js_status, r->js_head, r->mmu_rawstat, r->fault_status, r->fault_addr,
++	    rc == D2S_GPU_JOB_DONE ? "" : (r->reset_ok ? ", GPU reset OK" : ", GPU RESET FAILED"));
++}
++
++static void
++self_test(void)
++{
++	struct d2s_gpu_ctx c;
++	struct d2s_gpu_mem buf;
++	struct d2s_gpu_result r;
++	const uint64_t gva = 0x0000004000000000ull;	/* not identity: real 4-level walk */
++
++	if (!d2s_gpu_ctx_init(&c, 1) || !d2s_gpu_alloc(3 * GPAGE, &buf)) {
++		printf("D2S GPU: self-test: no memory\n");
++		return;
++	}
++	/* page 0: jobs (exec), pages 1-2: results; the gap below gva+3 pages
++	 * stays unmapped for the fault test */
++	if (!d2s_gpu_map(&c, gva, buf.pa, GPAGE, D2S_GPU_MAP_EXEC) ||
++	    !d2s_gpu_map(&c, gva + 2 * GPAGE, buf.pa + GPAGE, 2 * GPAGE, D2S_GPU_MAP_WRITE) ||
++	    !d2s_gpu_ctx_bind(&c)) {
++		printf("D2S GPU: self-test: map/bind failed\n");
++		return;
++	}
++	uint32_t *jobs = (uint32_t *)buf.va;
++	volatile uint32_t *res = (volatile uint32_t *)(buf.va + GPAGE);
++	uint64_t res_gva = gva + 2 * GPAGE;
++
++	/* 1. chain of two jobs: job 2 depends on job 1 and is reached by Next */
++	write_value_job(&jobs[0], 1, 0, gva + 64, res_gva + 0x00, 0xD25A0001u);
++	write_value_job(&jobs[16], 2, 1, 0, res_gva + GPAGE + 0x40, 0xD25A0002u);
++	res[0] = 0x11111111u;
++	res[(GPAGE + 0x40) / 4] = 0x22222222u;
++	d2s_gpu_sync(buf.pa, 3 * GPAGE, true);
++	int rc = d2s_gpu_run(&c, 0, gva, 100000, &r);
++	d2s_gpu_sync(buf.pa, 3 * GPAGE, false);
++	log_result("chain", rc, &r);
++	printf("D2S GPU: chain results %#x %#x, job exception %#x %#x\n",
++	    res[0], res[(GPAGE + 0x40) / 4], jobs[0], jobs[16]);
++	bool chain_ok = rc == D2S_GPU_JOB_DONE && res[0] == 0xD25A0001u &&
++	    res[(GPAGE + 0x40) / 4] == 0xD25A0002u;
++
++	/* 2. a write to an unmapped page must fault, and the GPU recover */
++	write_value_job(&jobs[0], 1, 0, 0, gva + GPAGE, 0xBAD);
++	d2s_gpu_sync(buf.pa, GPAGE, true);
++	rc = d2s_gpu_run(&c, 0, gva, 100000, &r);
++	log_result("fault test", rc, &r);
++	bool fault_ok = rc == D2S_GPU_JOB_MMU_FAULT && r.reset_ok &&
++	    (r.fault_addr & ~0xfffull) == gva + GPAGE;
++
++	/* 3. after the reset: bind again, one more job */
++	bool again_ok = false;
++	if (d2s_gpu_ctx_bind(&c)) {
++		write_value_job(&jobs[0], 1, 0, 0, res_gva + 0x80, 0xD25A0003u);
++		d2s_gpu_sync(buf.pa, 3 * GPAGE, true);
++		rc = d2s_gpu_run(&c, 0, gva, 100000, &r);
++		d2s_gpu_sync(buf.pa, 3 * GPAGE, false);
++		log_result("after reset", rc, &r);
++		again_ok = rc == D2S_GPU_JOB_DONE && res[0x80 / 4] == 0xD25A0003u;
++	}
++	printf("D2S GPU: SELF-TEST chain %s, fault %s, after-reset %s\n",
++	    chain_ok ? "OK" : "FAIL", fault_ok ? "OK" : "FAIL", again_ok ? "OK" : "FAIL");
++}
++
++void
++d2s_gpu_start(void)
++{
++	int test = 1;
++	(void)PE_parse_boot_argn("d2sgpu", &test, sizeof(test));
++
++	vm_offset_t pmu = ml_io_map(PMU_PA, 0x1000);
++	if (!pmu || !(*(volatile uint32_t *)(pmu + 0x104) & 1)) {
++		printf("D2S GPU: power domain off, not touching the GPU\n");
++		return;
++	}
++	gpu = ml_io_map(GPU_PA, GPU_SIZE);
++	if (!gpu) {
++		printf("D2S GPU: MMIO map failed\n");
++		return;
++	}
++	gpu_lck_grp = lck_grp_alloc_init("d2s_gpu", LCK_GRP_ATTR_NULL);
++	gpu_lock = lck_mtx_alloc_init(gpu_lck_grp, LCK_ATTR_NULL);
++
++	info.gpu_id = gr(GPU_ID);
++	info.mmu_features = gr(MMU_FEATURES);
++	info.as_present = gr(AS_PRESENT);
++	info.js_present = gr(JS_PRESENT);
++	info.shader_present = (uint64_t)gr(SHADER_PRESENT + 4) << 32 | gr(SHADER_PRESENT);
++	info.tiler_present = gr(TILER_PRESENT);
++	info.l2_present = gr(L2_PRESENT);
++	printf("D2S GPU: id %#x (product %#x r%up%u) shaders %#llx l2 %#x tiler %#x js %#x as %#x mmu %#x\n",
++	    info.gpu_id, info.gpu_id >> 16, (info.gpu_id >> 12) & 0xf, (info.gpu_id >> 4) & 0xff,
++	    info.shader_present, info.l2_present, info.tiler_present, info.js_present,
++	    info.as_present, info.mmu_features);
++	if ((info.gpu_id >> 16) != 0x7211) {
++		printf("D2S GPU: not a Mali-G76, stopping\n");
++		return;
++	}
++
++	if (kmem_alloc_contig(kernel_map, &pool_va, POOL_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("D2S GPU: no contiguous memory\n");
++		return;
++	}
++	pool_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)pool_va));
++	if (!gpu_reset()) {
++		printf("D2S GPU: reset/power-up failed (gpu status %#x, l2 %#x shader %#x)\n",
++		    gr(GPU_STATUS), gr(L2_READY), gr(SHADER_READY));
++		return;
++	}
++	gpu_ready = true;
++	printf("D2S GPU: ready, pool %u MiB at pa %#llx\n", POOL_SIZE >> 20, pool_pa);
++	if (test) {
++		self_test();
++	}
++}
++#else
++void
++d2s_gpu_start(void)
++{
++}
++#endif /* D2S */
+diff --git a/bsd/dev/d2s_gpu.h b/bsd/dev/d2s_gpu.h
+new file mode 100644
+index 0000000..79c5b84
+--- /dev/null
++++ b/bsd/dev/d2s_gpu.h
+@@ -0,0 +1,63 @@
++/*
++ * Galaxy Note 10+ (d2s) Mali-G76 kernel driver core (bsd/dev/d2s_gpu.c).
++ * Used by the boot self-test now and by the user client in GPU step 3b.
++ */
++#ifndef _D2S_GPU_H_
++#define _D2S_GPU_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <mach/vm_types.h>
++
++struct d2s_gpu_info {
++	uint32_t gpu_id;
++	uint32_t mmu_features;
++	uint32_t as_present;
++	uint32_t js_present;
++	uint64_t shader_present;
++	uint32_t tiler_present;
++	uint32_t l2_present;
++};
++
++struct d2s_gpu_mem {
++	vm_offset_t va;		/* kernel address */
++	uint64_t pa;
++	uint32_t size;
++};
++
++struct d2s_gpu_ctx {
++	int as;			/* hardware address space 0-7 */
++	bool bound;		/* tables loaded into the address space */
++	struct d2s_gpu_mem l0;
++};
++
++struct d2s_gpu_result {
++	uint32_t us;
++	uint32_t job_rawstat;
++	uint32_t js_status;
++	uint64_t js_head;
++	uint32_t mmu_rawstat;
++	uint32_t fault_status;
++	uint64_t fault_addr;
++	bool reset_ok;
++};
++
++#define D2S_GPU_MAP_WRITE	1u
++#define D2S_GPU_MAP_EXEC	2u
++
++#define D2S_GPU_JOB_DONE	0
++#define D2S_GPU_JOB_ERROR	1
++#define D2S_GPU_JOB_MMU_FAULT	2
++#define D2S_GPU_JOB_TIMEOUT	3
++#define D2S_GPU_JOB_INVALID	4
++
++const struct d2s_gpu_info *d2s_gpu_get_info(void);
++bool d2s_gpu_alloc(uint32_t size, struct d2s_gpu_mem *m);
++void d2s_gpu_sync(uint64_t pa, uint32_t len, bool to_gpu);
++bool d2s_gpu_ctx_init(struct d2s_gpu_ctx *c, int as);
++bool d2s_gpu_map(struct d2s_gpu_ctx *c, uint64_t va, uint64_t pa, uint64_t size, uint32_t flags);
++bool d2s_gpu_ctx_bind(struct d2s_gpu_ctx *c);
++int d2s_gpu_run(struct d2s_gpu_ctx *c, int js, uint64_t head, uint32_t timeout_us,
++    struct d2s_gpu_result *r);
++
++#endif

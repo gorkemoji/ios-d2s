@@ -75,7 +75,7 @@ index ba647a8..3f15f09 100644
 +#if defined(D2S)
 +/* Note 10+: S6SY771 on hsi2c_10, interrupt gpa1-0 (GPA1 DAT at 0x024). */
 +#define S8TS_HSI2C_PA           D2S_TOUCH_HSI2C_PHYS
-+#define S8BAT_HSI2C_PA          0x10970000u
++#define S8BAT_HSI2C_PA          0x15d60000u  /* hsi2c_12: max77705 */
 +#define S8TS_ALIVE_PA           D2S_ALIVE_PHYS
 +#define S8TS_GPA1_DAT           0x24u
 +#else

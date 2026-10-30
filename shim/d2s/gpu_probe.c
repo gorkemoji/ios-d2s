@@ -323,12 +323,8 @@ static void first_job(uint64_t shaders)
 	else
 		out("GPU JOB: completed but the value is wrong\n");
 
-	/* leave address space 0 unconfigured again */
-	gw(AS0 + AS_TRANSTAB_LO, 0);
-	gw(AS0 + AS_TRANSTAB_HI, 0);
-	gw(AS0 + AS_MEMATTR_LO, 0);
-	gw(AS0 + AS_COMMAND, AS_CMD_UPDATE);
-	as_wait();
+	/* Keep address space 0 active so MMU translation remains valid for runtime jobs */
+	out("GPU: keeping AS0 MMU translation active\n");
 }
 
 void gpu_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const char *))
@@ -416,8 +412,7 @@ void gpu_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const char 
 		: "GPU: some cores did not report ready\n");
 	if (all)
 		first_job((uint64_t)gr(SHADER_PRESENT + 4) << 32 | sh);
-	kv("shader off", cores(SHADER_PWROFF, SHADER_READY, sh, 0));
-	kv("tiler off", cores(TILER_PWROFF, TILER_READY, ti, 0));
-	kv("l2 off", cores(L2_PWROFF, L2_READY, l2, 0));
-	out("\n--- GPU PROBE DONE ---\n");
+	/* Keep GPU L2, Tiler, and Shader cores powered ON for XNU kernel runtime! */
+	out("GPU: keeping L2, tiler and all shader cores powered on for XNU\n");
+	out("\n--- GPU PROBE DONE (Mali-G76 Active) ---\n");
 }

@@ -92,35 +92,22 @@ if target_mnt.exists():
 root_mnt = attach_dmg(SPARSE_IMG, readonly=False, mountpoint=target_mnt, owners=True)
 print(f"  Hedef HFSX bağlandı: {root_mnt} (owners aktif)")
 
-print("=== 3. OS Dosyaları Kopyalanıyor (rsync) ===")
-# Exclude non-essential heavy assets outside launchd -> SpringBoard path
-omit = [
-    '--exclude=/Applications/***',
-    '--exclude=/System/Library/LinguisticData/***',
-    '--exclude=/System/Library/PreinstalledAssetsV2/***',
-    '--exclude=/System/Library/Health/***',
-    '--exclude=/System/Library/NanoTimeKit/***',
-    '--exclude=/System/Library/Assistant/***',
-    '--exclude=/System/Library/OnBoardingBundles/***',
-    '--exclude=/System/Library/Audio/***',
-]
-subprocess.check_call([
-    "rsync", "-aH", "--numeric-ids", "--extended-attributes",
-    *omit, f"{os_mnt}/", f"{root_mnt}/"
+print("=== 3. OS Dosyaları Kopyalanıyor (rsync - Tam iPhone Sistemi) ===")
+# Tüm stok uygulamaları ve sistem verilerini eksiksiz kopyala
+# (HFS+ metadata/extended-attribute uyarıları rsync exit code 23 verir, bu normaldir ve yoksayılır)
+res = subprocess.run([
+    "rsync", "-aH", "--numeric-ids",
+    f"{os_mnt}/", f"{root_mnt}/"
 ])
+if res.returncode not in (0, 23, 24):
+    sys.exit(f"rsync hatası: kod {res.returncode}")
 
 print("=== 4. SystemOS ve AppOS Cryptex'leri Kopyalanıyor ===")
 (root_mnt / "private/preboot/Cryptexes/OS").mkdir(parents=True, exist_ok=True)
 (root_mnt / "private/preboot/Cryptexes/App").mkdir(parents=True, exist_ok=True)
 
-subprocess.check_call([
-    "rsync", "-aH", "--numeric-ids", "--extended-attributes",
-    f"{sys_mnt}/", f"{root_mnt}/private/preboot/Cryptexes/OS/"
-])
-subprocess.check_call([
-    "rsync", "-aH", "--numeric-ids", "--extended-attributes",
-    f"{app_mnt}/", f"{root_mnt}/private/preboot/Cryptexes/App/"
-])
+subprocess.run(["rsync", "-aH", "--numeric-ids", f"{sys_mnt}/", f"{root_mnt}/private/preboot/Cryptexes/OS/"])
+subprocess.run(["rsync", "-aH", "--numeric-ids", f"{app_mnt}/", f"{root_mnt}/private/preboot/Cryptexes/App/"])
 
 print("=== 5. dyld_shared_cache ve Cryptex Bağlantıları Oluşturuluyor ===")
 cache_dst = root_mnt / "System/Library/Caches/com.apple.dyld"

@@ -56,18 +56,9 @@ MNT_ROOT=$(hdiutil attach "$SPARSE_IMG" -mountpoint /Volumes/iOSRoot -owners on 
 MOUNTED+=("$MNT_ROOT")
 echo "  Hedef baglandi: $MNT_ROOT (owners acik)"
 
-echo "=== 3. OS dosyalari kopyalaniyor (SpringBoard ve kütüphaneler dahil, gereksiz stok appler haric) ==="
-omit=(
-    '--exclude=/Applications/***'
-    '--exclude=/System/Library/LinguisticData/***'
-    '--exclude=/System/Library/PreinstalledAssetsV2/***'
-    '--exclude=/System/Library/Health/***'
-    '--exclude=/System/Library/NanoTimeKit/***'
-    '--exclude=/System/Library/Assistant/***'
-    '--exclude=/System/Library/OnBoardingBundles/***'
-    '--exclude=/System/Library/Audio/***'
-)
-rsync -aH --numeric-ids --extended-attributes "${omit[@]}" "$MNT_OS/" "$MNT_ROOT/"
+echo "=== 3. OS dosyalari kopyalaniyor (Tam iPhone Sistemi: Tum /Applications ve sistem verileri dahil) ==="
+# Tum stok uygulamalari (Preferences, Safari, Mesajlar vb.) ve sistem bilesenlerini eksiksiz kopyala
+rsync -aH --numeric-ids --extended-attributes "$MNT_OS/" "$MNT_ROOT/"
 
 echo "=== 4. SystemOS ve AppOS Cryptex'leri kopyalaniyor ==="
 mkdir -p "$MNT_ROOT/private/preboot/Cryptexes/OS" "$MNT_ROOT/private/preboot/Cryptexes/App"

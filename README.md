@@ -87,6 +87,8 @@ S-Boot (stock Samsung bootloader, EL1, MMU off)
 
 - [@Floppikrob](https://github.com/Floppikrob): Galaxy S8 port
 - [@MakrSas](https://github.com/MakrSas): contributor, mainline Linux on the S8 ([LinuxS8](https://github.com/MakrSas/LinuxS8))
+- [@david-42069](https://github.com/david-42069): Galaxy Note 10+ (d2s) port: multi-core boot, full-panel display, touchscreen
+- Claude (Anthropic): contributor to the Note 10+ port (touch power over ACPM, 9820 HSI2C driver)
 
 ## Credits
 

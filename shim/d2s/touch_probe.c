@@ -25,6 +25,13 @@
 #define PINCTRL_ALIVE		0x15850000UL
 #define GPA1_CON		(PINCTRL_ALIVE + 0x020)
 #define GPA1_DAT		(PINCTRL_ALIVE + 0x024)
+#define GPA1_PUD		(PINCTRL_ALIVE + 0x028)
+
+/* Exynos 9820 banks: CON 4 bits, DAT 1 bit, PUD 4 bits per pin
+ * (pinctrl-exynos-arm64.c exynos9810_bank_type_off/alive);
+ * PUD 0 = none, 1 = pull-down, 3 = pull-up (dt-bindings samsung.h). */
+#define NIB(pin)		(0xfu << ((pin) * 4))
+#define PUD_DOWN(pin)		(1u << ((pin) * 4))
 
 #define HSI2C_BASE		0x104b0000UL
 #define USI_CON			(HSI2C_BASE + 0x0c4)	/* bit 0 = USI reset, active high */
@@ -194,6 +201,72 @@ static void dump(const char *what, const uint8_t *b, unsigned n, uint32_t st)
 	out("\n");
 }
 
+/*
+ * Read-only power check, no PMIC access. SCL/SDA (gpp1-4/5) and the
+ * interrupt (gpa1-0) are pulled up on the touch side; with the touch rails
+ * off nothing drives them. Make the three pins inputs with the SoC's weak
+ * pull-down: a powered touch side still reads 1, an unpowered one reads 0.
+ * The interrupt pin is restored afterwards; the I2C pins are set up below.
+ */
+static void pin_check(void)
+{
+	uint32_t pcon = rd(GPP1_CON), ppud = rd(GPP1_PUD);
+	uint32_t acon = rd(GPA1_CON), apud = rd(GPA1_PUD);
+	out("PIN CHECK (read only, no PMIC)\n");
+	kv("gpp1 con", pcon);
+	kv("dat", rd(GPP1_DAT));
+	kv("pud", ppud);
+	kv("gpa1 con", acon);
+	kv("dat", rd(GPA1_DAT));
+	kv("pud", apud);
+	out("\n");
+	/* 1. as left by S-Boot */
+	uint32_t d = rd(GPP1_DAT), a = rd(GPA1_DAT);
+	kv("as-is scl", (d >> 4) & 1);
+	kv("sda", (d >> 5) & 1);
+	kv("irq", a & 1);
+	out("\n");
+	/* 2. inputs, no pull */
+	wr(GPP1_CON, pcon & ~(NIB(4) | NIB(5)));
+	wr(GPP1_PUD, ppud & ~(NIB(4) | NIB(5)));
+	wr(GPA1_CON, acon & ~NIB(0));
+	wr(GPA1_PUD, apud & ~NIB(0));
+	delay_ms(5);
+	d = rd(GPP1_DAT);
+	a = rd(GPA1_DAT);
+	kv("float scl", (d >> 4) & 1);
+	kv("sda", (d >> 5) & 1);
+	kv("irq", a & 1);
+	out("\n");
+	/* 3. inputs, weak pull-down: only a powered pull-up keeps them at 1 */
+	wr(GPP1_PUD, (ppud & ~(NIB(4) | NIB(5))) | PUD_DOWN(4) | PUD_DOWN(5));
+	wr(GPA1_PUD, (apud & ~NIB(0)) | PUD_DOWN(0));
+	delay_ms(5);
+	unsigned scl = 0, sda = 0, irq = 0;
+	for (unsigned i = 0; i < 8; i++) {
+		d = rd(GPP1_DAT);
+		a = rd(GPA1_DAT);
+		scl += (d >> 4) & 1;
+		sda += (d >> 5) & 1;
+		irq += a & 1;
+		delay_ms(1);
+	}
+	kv("pulldown scl", scl);
+	kv("sda", sda);
+	kv("irq", irq);
+	out(" (of 8)\n");
+	if (scl == 8 && sda == 8)
+		out("PIN CHECK: I2C lines held high -> touch I/O rail looks ON\n");
+	else if (scl == 0 && sda == 0)
+		out("PIN CHECK: I2C lines low -> touch I/O rail looks OFF\n");
+	else
+		out("PIN CHECK: mixed levels -> inconclusive\n");
+	/* restore the interrupt pin; I2C pins are configured by the caller */
+	wr(GPA1_PUD, apud);
+	wr(GPA1_CON, acon);
+	wr(GPP1_PUD, ppud);
+}
+
 void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const char *))
 {
 	uint8_t c, b[11];
@@ -202,6 +275,7 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	kv = kv_fn;
 	out = out_fn;
 	out("\n--- D2S TOUCH PROBE (S6SY771 on hsi2c_10 @ 0x104b0000) ---\n");
+	pin_check();
 
 	/* 0. Clocks: ungate USI03 (bus + IP clock, reset sync), GPIO and
 	 * SYSREG of PERIC0; USI03 from OSCCLK, divider 1; USI mode I2C. */
@@ -231,7 +305,7 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	gpp1_con &= ~(0xffu << 16);
 	gpp1_con |= (0x22u << 16);
 	wr(GPP1_CON, gpp1_con);
-	wr(GPP1_PUD, rd(GPP1_PUD) & ~(0x0fu << 8));
+	wr(GPP1_PUD, rd(GPP1_PUD) & ~(NIB(4) | NIB(5)));	/* no pull (4-bit fields) */
 	kv("gpp1_con", rd(GPP1_CON));
 
 	/* 2. Release the USI reset (i2c-exynos5.c exynos_usi_init) */

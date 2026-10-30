@@ -16,6 +16,7 @@
 #include <stdint.h>
 #define NULL ((void *)0)
 #include "touch_probe.h"
+#include "s2mps19.h"
 
 #define PINCTRL_PERIC0		0x10430000UL
 #define GPP1_CON		(PINCTRL_PERIC0 + 0x020)
@@ -107,81 +108,117 @@ static void delay_ms(unsigned ms)
 		;
 }
 
+/*
+ * Exynos 9820 HSI2C timing (Samsung i2c-exynos5.c exynos5_i2c_set_timing,
+ * fast mode). Unlike the mainline/8895 driver the SCL-high and start-hold
+ * fields are bit masks ("make to 0 from LSB"), not cycle counts. Stock
+ * Android logs for this bus at 200 MHz: FS1 0x01f0ff00, FS2 0x030003e0,
+ * FS3 0x00210000, which this formula reproduces; the other fields are kept
+ * from those values. At 26 MHz: div 4, SCL-high 0xf0, start-hold 0xf8.
+ */
 static void set_timing(void)
 {
-	unsigned ftl = (hr(CONF) >> 16) & 7;
-	unsigned temp = CLKIN / SCL_HZ - (ftl + 3) * 2;
-	unsigned div = temp / 512;
-	unsigned cyc = (temp + ((ftl + 3) % (div + 1)) * 2) / (div + 1) - 2;
-	unsigned l = cyc * 64 / 100, h = cyc - l;
-	hw(TIMING_FS1, l << 24 | l << 16 | l << 8);
-	hw(TIMING_FS2, (l / 2) << 24 | l << 8 | h);
-	hw(TIMING_FS3, div << 16 | cyc);
-	hw(TIMING_SLA, l / 2);
+	unsigned div = (CLKIN / (SCL_HZ * 15)) & 0xff;
+	unsigned n = (9 * (CLKIN / 1000000)) / ((div + 1) * 10);
+	unsigned tscl_h = (0xffffffffu >> n << n) & 0xff;
+	unsigned tstart_hd = (0xffffffffu >> (n - 1) << (n - 1)) & 0xff;
+	hw(TIMING_FS1, 0x0100ff00u | tstart_hd << 16);
+	hw(TIMING_FS2, 0x03000300u | tscl_h);
+	hw(TIMING_FS3, div << 16);
 }
 
+/* exynos5_i2c_reset + exynos5_i2c_init */
 static void hsi2c_reset(void)
 {
 	hw(CTL, hr(CTL) | CTL_SW_RST);
 	hw(CTL, hr(CTL) & ~CTL_SW_RST);
 	set_timing();
-	hw(TIMEOUT, hr(TIMEOUT) & ~(1u << 31));
-	hw(CTL, CTL_I2C_MASTER);
-	hw(TRAILIG_CTL, 0xf);
+	hw(CTL, 1u << 3);			/* HSI2C_MASTER, as Samsung */
+	hw(TRAILIG_CTL, 0xffffff);
 	hw(CONF, hr(CONF) | CONF_AUTO_MODE);
 }
 
-static uint32_t wait_done(void)
+static uint32_t mast_st(void) { return hr(TRANS_STATUS) & 0xf; }
+
+/* Detail for a failed transfer: INT, TRANS, FIFO status and SCL/SDA. */
+static uint32_t fail_info(uint32_t why)
 {
-	uint64_t end = ticks() + TIMER_HZ / 20;
-	for (;;) {
-		uint32_t s = hr(INT_STATUS);
-		if (s & (INT_DONE | INT_ERRS)) {
-			hw(INT_STATUS, s);
-			return (s & INT_ERRS) ? s : 0;
-		}
-		if (ticks() > end)
-			return 0x80000000u | hr(TRANS_STATUS);
+	kv(" FAIL why", why);
+	kv("int", hr(INT_STATUS));
+	kv("trans", hr(TRANS_STATUS));
+	kv("fifo", hr(FIFO_STATUS));
+	kv("auto", hr(AUTO_CONF));
+	kv("lines", (rd(GPP1_DAT) >> 4) & 3);
+	out("\n");
+	return why;
+}
+
+/*
+ * One message as Samsung's exynos5_i2c_xfer_msg in polling mode, with
+ * samsung,stop-after-trans (STOP after every message) and
+ * samsung,scl-clk-stretching (wait for master state INIT afterwards).
+ */
+static uint32_t msg(int read, uint8_t *buf, unsigned len)
+{
+	uint32_t ctl = hr(CTL) & ~(CTL_RXCHON | CTL_TXCHON);
+	uint32_t ac = hr(AUTO_CONF) & ~(0xffffu | AUTO_READ | AUTO_RUN);
+	hw(TIMEOUT, hr(TIMEOUT) & ~(1u << 31));
+	hw(FIFO_CTL, 3 | len << 4 | len << 16);
+	if (read) {
+		ctl |= CTL_RXCHON;
+		ac |= AUTO_READ;
+	} else {
+		ctl |= CTL_TXCHON;
 	}
+	ac |= AUTO_STOP | len;
+	hw(INT_STATUS, hr(INT_STATUS));
+	hw(ADDR, 7u << 24 | (TS_ADDR & 0x7f) << 10);
+	hw(CTL, ctl);
+	hw(INT_ENABLE, INT_DONE | INT_ERRS);
+	hw(AUTO_CONF, ac);
+	hw(AUTO_CONF, hr(AUTO_CONF) | AUTO_RUN);
+
+	uint64_t end = ticks() + TIMER_HZ / 20;
+	unsigned i = 0;
+	if (read) {
+		while (i < len && ticks() < end) {
+			if (hr(INT_STATUS) & INT_ERRS)
+				return fail_info(1);
+			if (!(hr(FIFO_STATUS) & RX_EMPTY))
+				buf[i++] = (uint8_t)hr(RX_DATA);
+		}
+		if (i < len)
+			return fail_info(0x100 | i);
+	} else {
+		for (;;) {
+			if (i < len && (hr(FIFO_STATUS) & 0x7f) < 64)
+				hw(TX_DATA, buf[i++]);
+			uint32_t s = hr(INT_STATUS);
+			if (s & INT_ERRS)
+				return fail_info(2);
+			if (i == len && (s & INT_DONE) && (hr(FIFO_STATUS) & (1u << 8))) {
+				hw(INT_STATUS, s);
+				break;
+			}
+			if (ticks() > end)
+				return fail_info(3);
+		}
+	}
+	/* bus released: master back in INIT (scl-clk-stretching check) */
+	end = ticks() + TIMER_HZ / 10;
+	while (mast_st() != 1)
+		if (ticks() > end)
+			return fail_info(4);
+	return 0;
 }
 
 static uint32_t xfer(const uint8_t *w, unsigned wlen, uint8_t *r, unsigned rlen)
 {
-	uint32_t st;
-	hw(INT_STATUS, hr(INT_STATUS));
-	hw(ADDR, (TS_ADDR & 0x3ff) << 10);
-	hw(INT_ENABLE, INT_DONE | INT_ERRS);
-	if (wlen) {
-		hw(FIFO_CTL, 3);
-		hw(CTL, CTL_I2C_MASTER | CTL_TXCHON);
-		hw(AUTO_CONF, (rlen ? 0 : AUTO_STOP) | wlen | AUTO_RUN);
-		for (unsigned i = 0; i < wlen; i++) {
-			uint64_t end = ticks() + TIMER_HZ / 100;
-			while ((hr(FIFO_STATUS) & TX_FULL) && ticks() < end)
-				;
-			hw(TX_DATA, w[i]);
-		}
-		if ((st = wait_done()))
-			goto bad;
-	}
-	if (rlen) {
-		hw(FIFO_CTL, 3);
-		hw(CTL, CTL_I2C_MASTER | CTL_RXCHON);
-		hw(AUTO_CONF, AUTO_READ | AUTO_STOP | rlen | AUTO_RUN);
-		for (unsigned i = 0; i < rlen; i++) {
-			uint64_t end = ticks() + TIMER_HZ / 20;
-			while ((hr(FIFO_STATUS) & RX_EMPTY) && ticks() < end)
-				;
-			if (hr(FIFO_STATUS) & RX_EMPTY) {
-				st = 0x40000000u | i;
-				goto bad;
-			}
-			r[i] = (uint8_t)hr(RX_DATA);
-		}
-		if ((st = wait_done()))
-			goto bad;
-	}
-	hw(CTL, CTL_I2C_MASTER);
+	uint32_t st = 0;
+	if (wlen && (st = msg(0, (uint8_t *)w, wlen)))
+		goto bad;
+	if (rlen && (st = msg(1, r, rlen)))
+		goto bad;
 	return 0;
 bad:
 	hsi2c_reset();
@@ -276,6 +313,10 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	out = out_fn;
 	out("\n--- D2S TOUCH PROBE (S6SY771 on hsi2c_10 @ 0x104b0000) ---\n");
 	pin_check();
+	/* The check above found the rails off on every boot so far: power them
+	 * the way sec_ts_power() does, then check the pins again. */
+	if (!s2mps19_touch_rails_on(kv, out))
+		pin_check();
 
 	/* 0. Clocks: ungate USI03 (bus + IP clock, reset sync), GPIO and
 	 * SYSREG of PERIC0; USI03 from OSCCLK, divider 1; USI mode I2C. */
@@ -320,6 +361,10 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	hsi2c_reset();
 	kv("hsi2c_ctl", hr(CTL));
 	kv("conf", hr(CONF));
+	kv("fs1", hr(TIMING_FS1));
+	kv("fs2", hr(TIMING_FS2));
+	kv("fs3", hr(TIMING_FS3));
+	kv("trans", hr(TRANS_STATUS));
 	out("\n");
 
 	/* 5. Probe Touch IC */

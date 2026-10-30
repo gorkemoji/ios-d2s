@@ -52,6 +52,8 @@ def main():
                              "(e.g. one from tools/d2s_adt_add_cpus.py)")
     parser.add_argument("--no-build-shim", action="store_true",
                         help="Skip recompiling shim/d2s/out/Image")
+    parser.add_argument("--files", type=Path,
+                        help="tools/mkfiles.py blob the kernel installs into the iOS root at boot")
     args = parser.parse_args()
 
     # 1. Compile shim
@@ -83,7 +85,7 @@ def main():
         str(payload_path),
         "--cmdline",
         args.cmdline
-    ])
+    ] + (["--files", str(args.files)] if args.files else []))
 
     # 4. Merge Loader + Payload + DTB
     print("[*] Step 4: Assembling kernel blob (loader @ 0x0, payload @ 0x40000, dtb appended)...")

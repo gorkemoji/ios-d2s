@@ -1,13 +1,19 @@
 #!/bin/sh
-# Build d2sgpu-test for iOS 16 arm64 (needs Xcode; runs on the macOS CI
-# runner, see .github/workflows/d2s-gpu-tools.yml). Output: out/d2sgpu-test,
-# ad-hoc signed.
+# Build the D2SGPU test for iOS 16 arm64 (needs Xcode; runs on the macOS CI
+# runner, see .github/workflows/d2s-gpu-tools.yml), ad-hoc signed:
+#   out/d2sgpu-test        command-line program
+#   out/d2sgpu-test.dylib  the same test, run once inside backboardd
+#                          (inserted with the d2senv boot-arg)
 set -eu
 cd "$(dirname "$0")"
 mkdir -p out
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 \
-	-O2 -Wall -Wextra -Werror -o out/d2sgpu-test d2sgpu-test.c \
-	-framework IOKit -framework CoreFoundation
-codesign -f -s - out/d2sgpu-test
-file out/d2sgpu-test
+CC="xcrun --sdk iphoneos clang -arch arm64 -isysroot $SDK -miphoneos-version-min=16.0 -O2 -Wall -Wextra -Werror"
+LIBS="-framework IOKit -framework CoreFoundation"
+$CC -o out/d2sgpu-test d2sgpu-test.c $LIBS
+$CC -dynamiclib -DD2SGPU_DYLIB -install_name /usr/lib/d2sgpu-test.dylib \
+	-o out/d2sgpu-test.dylib d2sgpu-test.c $LIBS
+for f in out/d2sgpu-test out/d2sgpu-test.dylib; do
+	codesign -f -s - "$f"
+	file "$f"
+done

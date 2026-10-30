@@ -49,8 +49,8 @@ write_value_job(volatile uint32_t *j, uint64_t dst, uint32_t value)
 	j[12] = value;
 }
 
-int
-main(void)
+static int
+run_test(void)
 {
 	conn = d2sgpu_open();
 	if (conn == MACH_PORT_NULL) {
@@ -109,5 +109,46 @@ main(void)
 	    ok1 && ok2 && ok3 ? "OK" : "FAIL", ok1 ? "ok" : "FAIL", ok2 ? "ok" : "FAIL",
 	    ok3 ? "ok" : "FAIL");
 	IOServiceClose(conn);
+	conn = MACH_PORT_NULL;
 	return ok1 && ok2 && ok3 ? 0 : 1;
 }
+
+#ifdef D2SGPU_DYLIB
+/*
+ * Library build (d2sgpu-test.dylib), inserted into backboardd by the
+ * d2senv boot-arg: run the test once on a thread of its own, a few
+ * seconds after load, so backboardd's start-up is not held up. In any
+ * other process that inherits the variable it does nothing.
+ */
+#include <pthread.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+static void *
+test_thread(void *arg)
+{
+	(void)arg;
+	sleep(5);
+	run_test();
+	return NULL;
+}
+
+__attribute__((constructor)) static void
+d2sgpu_test_load(void)
+{
+	const char *name = getprogname();
+	if (name == NULL || strcmp(name, "backboardd") != 0) {
+		return;
+	}
+	pthread_t t;
+	if (pthread_create(&t, NULL, test_thread, NULL) == 0) {
+		pthread_detach(t);
+	}
+}
+#else
+int
+main(void)
+{
+	return run_test();
+}
+#endif

@@ -1,0 +1,400 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ed8b66e..b7272ef 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/d2s_gpu.c			standard
++bsd/kern/d2s_files.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 28b589c..d407ec8 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -1080,6 +1080,7 @@ dreamlte_touch_start(void)
+ #endif /* DREAMLTE */
+ 
+ extern void d2s_gpu_start(void);
++extern void d2s_files_start(void);
+ 
+ void
+ a5xelte_touch_probe(void)
+@@ -1089,6 +1090,7 @@ a5xelte_touch_probe(void)
+ #endif
+ #if defined(D2S)
+ 	d2s_gpu_start();          /* Mali-G76 core + boot self-test (d2s_gpu.c) */
++	d2s_files_start();        /* boot-image files into the iOS root (d2s_files.c) */
+ #endif
+ 	int enabled = A5_TOUCH_DEFAULT; /* A5 touch: off on the S8 */
+ 	int log_contacts = 0;
+diff --git a/bsd/kern/d2s_files.c b/bsd/kern/d2s_files.c
+new file mode 100644
+index 0000000..e9f3dc9
+--- /dev/null
++++ b/bsd/kern/d2s_files.c
+@@ -0,0 +1,201 @@
++/*
++ * Galaxy Note 10+ (d2s): install files carried in the boot image into the
++ * iOS root at boot, so user-space pieces (GPU test, later the GL library)
++ * arrive with the kernel and nothing edits the HFS+ root from Linux.
++ *
++ * tools/mkfiles.py packs the files; tools/mkpayload.py --files places the
++ * blob after the kernel (like the RAM disk) and records it in the ADT as
++ * /chosen/memory-map "D2SFiles" = <phys, size>. Format (little endian):
++ *
++ *   "D2SFILE1" | u32 version 1 | u32 count
++ *   count records, each 8-byte aligned:
++ *     u32 size (whole record) | u16 op | u16 0 | u32 mode | u32 uid | u32 gid
++ *     u32 path_len (with NUL) | u32 data_len | u32 0 | path | pad | data
++ *   op 1: write always, op 2: write only if the path does not exist
++ *
++ * The root is read-only until launchd's own `mount -uw /`, so a kernel
++ * thread waits for that (up to 120 s), then writes every file: open with
++ * O_CREAT, truncate (vnode_open does not), write, set owner and mode.
++ * d2s_files_wait() lets exec hold a process until this is done.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/fcntl.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/kauth.h>
++#include <sys/proc.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <pexpert/arm64/board_config.h>
++
++void d2s_files_start(void);
++bool d2s_files_wait(uint32_t ms);
++
++#if defined(D2S)
++extern struct vnode *rootvnode;
++extern void IOSleep(unsigned int milliseconds);
++
++#define OP_WRITE		1
++#define OP_WRITE_IF_ABSENT	2
++
++struct d2s_file_rec {
++	uint32_t size;
++	uint16_t op;
++	uint16_t pad0;
++	uint32_t mode, uid, gid;
++	uint32_t path_len, data_len;
++	uint32_t pad1;
++};
++
++static const uint8_t *blob;
++static uint32_t blob_size;
++static volatile int files_state;	/* 0 working, 1 done (or nothing to do) */
++
++static int
++write_one(const char *path, const void *data, uint32_t len, const struct d2s_file_rec *r)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int err;
++
++	if (r->op == OP_WRITE_IF_ABSENT && vnode_lookup(path, 0, &vp, ctx) == 0) {
++		vnode_put(vp);
++		return EEXIST;
++	}
++	err = vnode_open(path, O_CREAT | FWRITE | O_NOFOLLOW, (int)(r->mode & 07777),
++	    VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (err) {
++		return err;
++	}
++	err = vnode_setsize(vp, 0, 0, ctx);
++	if (!err && len) {
++		int resid = 0;
++		err = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0,
++		    UIO_SYSSPACE, IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!err && resid) {
++			err = EIO;
++		}
++	}
++	if (!err) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, r->uid);
++		VATTR_SET(&va, va_gid, r->gid);
++		VATTR_SET(&va, va_mode, r->mode & 07777);
++		err = vnode_setattr(vp, &va, ctx);
++	}
++	vnode_close(vp, FWRITE, ctx);
++	return err;
++}
++
++static void
++install(void)
++{
++	uint32_t count = *(const uint32_t *)(blob + 12), off = 16, ok = 0, kept = 0, bad = 0;
++	for (uint32_t i = 0; i < count; i++) {
++		const struct d2s_file_rec *r = (const struct d2s_file_rec *)(blob + off);
++		if (off + sizeof(*r) > blob_size || r->size < sizeof(*r) || r->size > blob_size - off ||
++		    r->path_len < 2 || sizeof(*r) + r->path_len > r->size) {
++			printf("D2S FILES: record %u malformed, stopping\n", i);
++			bad++;
++			break;
++		}
++		const char *path = (const char *)(r + 1);
++		uint32_t data_off = (uint32_t)sizeof(*r) + ((r->path_len + 7) & ~7u);
++		if (path[r->path_len - 1] != 0 || path[0] != '/' || data_off + r->data_len > r->size) {
++			printf("D2S FILES: record %u malformed, stopping\n", i);
++			bad++;
++			break;
++		}
++		int err = write_one(path, (const uint8_t *)r + data_off, r->data_len, r);
++		if (err == EEXIST) {
++			kept++;
++		} else if (err) {
++			bad++;
++		} else {
++			ok++;
++		}
++		printf("D2S FILES: %s (%u bytes, mode %o, %u:%u): %s, error %d\n", path, r->data_len,
++		    r->mode & 07777, r->uid, r->gid,
++		    err == EEXIST ? "kept" : err ? "FAILED" : "written", err == EEXIST ? 0 : err);
++		off += r->size;
++	}
++	printf("D2S FILES: done, %u written, %u kept, %u failed\n", ok, kept, bad);
++}
++
++static void
++files_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	int waited = 0;
++	while (waited < 120000) {
++		vnode_t root = rootvnode;
++		if (root != NULLVP && !vfs_isrdonly(vnode_mount(root))) {
++			break;
++		}
++		IOSleep(50);
++		waited += 50;
++	}
++	if (waited >= 120000) {
++		printf("D2S FILES: root still read-only after 120 s, nothing installed\n");
++	} else {
++		printf("D2S FILES: root writable after %d ms\n", waited);
++		install();
++	}
++	files_state = 1;
++}
++
++void
++d2s_files_start(void)
++{
++	DTEntry mm;
++	void const *prop;
++	unsigned int size;
++	files_state = 1;
++	if (SecureDTLookupEntry(NULL, "/chosen/memory-map", &mm) != kSuccess ||
++	    SecureDTGetProperty(mm, "D2SFiles", &prop, &size) != kSuccess || size < 16) {
++		return;			/* no files in this boot image */
++	}
++	const uint64_t *range = prop;
++	blob = (const uint8_t *)ml_static_ptovirt((vm_offset_t)range[0]);
++	blob_size = (uint32_t)range[1];
++	if (blob == NULL || blob_size < 16 || memcmp(blob, "D2SFILE1", 8) != 0 ||
++	    *(const uint32_t *)(blob + 8) != 1) {
++		printf("D2S FILES: blob at %#llx (%u bytes) is not D2SFILE1 v1\n", range[0], blob_size);
++		return;
++	}
++	printf("D2S FILES: %u files in the boot image (%u bytes)\n",
++	    *(const uint32_t *)(blob + 12), blob_size);
++	files_state = 0;
++	thread_t th;
++	if (kernel_thread_start(files_thread, NULL, &th) != KERN_SUCCESS) {
++		printf("D2S FILES: no thread\n");
++		files_state = 1;
++		return;
++	}
++	thread_deallocate(th);
++}
++
++/* Wait up to ms for the install; true if it finished. */
++bool
++d2s_files_wait(uint32_t ms)
++{
++	for (uint32_t t = 0; files_state == 0 && t < ms; t += 10) {
++		IOSleep(10);
++	}
++	return files_state != 0;
++}
++#else
++void
++d2s_files_start(void)
++{
++}
++
++bool
++d2s_files_wait(__unused uint32_t ms)
++{
++	return true;
++}
++#endif /* D2S */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index deccec2..f813f12 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -445,6 +445,74 @@ exec_add_user_string(struct image_params *imgp, user_addr_t str, int seg, boolea
+ 	return error;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++extern bool d2s_files_wait(uint32_t ms);
++
++/*
++ * Boot-arg d2senv=NAME:VAR=VALUE adds VAR=VALUE to the environment of every
++ * program whose file name is NAME (one rule), e.g.
++ *   d2senv=backboardd:DYLD_INSERT_LIBRARIES=/usr/lib/d2sgpu-test-1234abcd.dylib
++ * For DYLD_INSERT_LIBRARIES the exec first waits (up to 10 s) for the boot
++ * file install (d2s_files.c) and leaves the variable out when the library
++ * is missing, so the program still starts without it.
++ */
++static int
++d2s_exec_env(struct image_params *imgp, int ptr_size)
++{
++	static char rule[200];
++	static size_t n;		/* length of NAME */
++	static int parsed;		/* 0 not yet, 1 no rule, 2 rule */
++	if (parsed == 0) {
++		parsed = 1;
++		if (PE_parse_boot_argn("d2senv", rule, sizeof(rule))) {
++			while (rule[n] && rule[n] != ':') {
++				n++;
++			}
++			if (n > 0 && rule[n] == ':' && rule[n + 1]) {
++				parsed = 2;
++			}
++		}
++	}
++	if (parsed != 2) {
++		return 0;
++	}
++	/* the first string is "executable_path=<path>": compare its file name */
++	const char *name = imgp->ip_strings;
++	for (const char *c = imgp->ip_strings; *c; c++) {
++		if (*c == '/' || (*c == '=' && name == imgp->ip_strings)) {
++			name = c + 1;
++		}
++	}
++	if (strlen(name) != n || strncmp(name, rule, n) != 0) {
++		return 0;
++	}
++	const char *var = rule + n + 1;
++	static const char dyld_insert[] = "DYLD_INSERT_LIBRARIES=";
++	if (strncmp(var, dyld_insert, sizeof(dyld_insert) - 1) == 0) {
++		const char *lib = var + sizeof(dyld_insert) - 1;
++		vnode_t vp = NULLVP;
++		bool done = d2s_files_wait(10000);
++		if (vnode_lookup(lib, 0, &vp, vfs_context_current()) != 0) {
++			printf("D2S ENV: %s: %s missing (file install %s), not inserted\n",
++			    name, lib, done ? "done" : "still running");
++			return 0;
++		}
++		vnode_put(vp);
++	}
++	int error = exec_add_user_string(imgp, CAST_USER_ADDR_T(var), UIO_SYSSPACE, TRUE);
++	if (error) {
++		return error;
++	}
++	if (imgp->ip_argspace < ptr_size) {
++		return E2BIG;
++	}
++	imgp->ip_argspace -= ptr_size;	/* its envv[] entry */
++	imgp->ip_envc++;
++	printf("D2S ENV: %s += %s\n", name, var);
++	return 0;
++}
++#endif
++
+ /*
+  * dyld is now passed the executable path as a getenv-like variable
+  * in the same fashion as the stack_guard and malloc_entropy keys.
+@@ -5741,6 +5809,13 @@ exec_extract_strings(struct image_params *imgp)
+ 		imgp->ip_envc++;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	error = d2s_exec_env(imgp, new_ptr_size);
++	if (error) {
++		goto bad;
++	}
++#endif
++
+ 	/* Save space for envv[] NULL terminator */
+ 	if (imgp->ip_argspace < new_ptr_size) {
+ 		error = E2BIG;
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 4fd8729..d40a2c9 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -385,6 +385,51 @@ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
+ 
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++/*
++ * dyld asks __mac_syscall("AMFI", 0x5a, {u64 in_flags; u64 *out_flags})
++ * (amfi_check_dyld_policy_self) which DYLD_* variables to honour, and on
++ * iOS honours none when the call fails. Answer it, so the d2senv boot-arg
++ * (kern_exec.c) can insert a library: allow @-paths, path and fallback
++ * variables, print variables, failed insertion (a broken library must not
++ * stop the program) and interposing; not a custom shared cache.
++ */
++#define DYLD_ALLOW_AT_PATH		0x01ull
++#define DYLD_ALLOW_PATH_VARS		0x02ull
++#define DYLD_ALLOW_FALLBACK_PATHS	0x08ull
++#define DYLD_ALLOW_PRINT_VARS		0x10ull
++#define DYLD_ALLOW_FAILED_INSERTION	0x20ull
++#define DYLD_ALLOW_INTERPOSING		0x40ull
++#define AMFI_OP_DYLD_POLICY_SELF	0x5a
++
++static int
++d2s_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	uint64_t a[2];
++	uint64_t allow = DYLD_ALLOW_AT_PATH | DYLD_ALLOW_PATH_VARS | DYLD_ALLOW_FALLBACK_PATHS |
++	    DYLD_ALLOW_PRINT_VARS | DYLD_ALLOW_FAILED_INSERTION | DYLD_ALLOW_INTERPOSING;
++	if (call != AMFI_OP_DYLD_POLICY_SELF) {
++		return ENOPOLICY;
++	}
++	if (copyin(arg, a, sizeof(a)) != 0 || a[1] == 0) {
++		return EFAULT;
++	}
++	return copyout(&allow, (user_addr_t)a[1], sizeof(allow));
++}
++
++static const struct mac_policy_ops d2s_amfi_dyld_ops = {
++	.mpo_policy_syscall = d2s_amfi_syscall,
++};
++
++static struct mac_policy_conf d2s_amfi_dyld_conf = {
++	.mpc_name = "AMFI",		/* __mac_syscall finds policies by name */
++	.mpc_fullname = PORT_NAME " dyld policy answer",
++	.mpc_ops = &d2s_amfi_dyld_ops,
++};
++
++static mac_policy_handle_t d2s_amfi_dyld_handle;
++#endif
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -394,6 +439,11 @@ sweet_amfi_policy_register(void)
+ 	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+ 	printf(PORT_NAME " AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++	error = mac_policy_register(&d2s_amfi_dyld_conf, &d2s_amfi_dyld_handle, NULL);
++	printf(PORT_NAME " AMFI: dyld policy answer %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
++#endif
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf(PORT_NAME " Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);

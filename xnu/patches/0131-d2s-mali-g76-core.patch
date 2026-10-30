@@ -33,10 +33,10 @@ index 6cc1fd9..28b589c 100644
  	int log_contacts = 0;
 diff --git a/bsd/dev/d2s_gpu.c b/bsd/dev/d2s_gpu.c
 new file mode 100644
-index 0000000..400111f
+index 0000000..328a3d4
 --- /dev/null
 +++ b/bsd/dev/d2s_gpu.c
-@@ -0,0 +1,577 @@
+@@ -0,0 +1,581 @@
 +/*
 + * Galaxy Note 10+ (d2s, Exynos 9825): Mali-G76 MP12 kernel driver core.
 + *
@@ -77,6 +77,10 @@ index 0000000..400111f
 +
 +#if defined(D2S)
 +#include "d2s_gpu.h"
++
++/* Not exported to BSD code by the headers; same approach as a5xelte_touch.c. */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
 +
 +#define GPU_PA			0x18500000ull
 +#define GPU_SIZE		0x5000

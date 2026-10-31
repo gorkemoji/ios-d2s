@@ -39,6 +39,10 @@ enum {
 	D2SGPU_BUF_DESTROY = 2,
 	D2SGPU_SUBMIT = 3,
 	D2SGPU_LOG = 4,
+	D2SGPU_SUBMIT_ASYNC = 5,
+	D2SGPU_WAIT = 6,
+	D2SGPU_BUF_WAIT = 7,
+	D2SGPU_IMPORT_SURFACE = 8,
 };
 
 #define D2SGPU_BUF_GPU_WRITE	1u
@@ -138,6 +142,58 @@ static inline void
 d2sgpu_log(io_connect_t c, const char *text, size_t len)
 {
 	IOConnectCallMethod(c, D2SGPU_LOG, NULL, 0, text, len, NULL, NULL, NULL, NULL);
+}
+
+/* Queue a job chain; the listed buffers are written back from the CPU
+ * caches first and remember this job for d2sgpu_buf_wait. */
+static inline kern_return_t
+d2sgpu_submit_async(io_connect_t c, int js, uint64_t head, const uint32_t *handles,
+    uint32_t n, uint64_t *seq)
+{
+	uint64_t in[2] = { (uint64_t)js, head };
+	uint32_t nout = 1;
+	return IOConnectCallMethod(c, D2SGPU_SUBMIT_ASYNC, in, 2, handles, n * sizeof(uint32_t),
+	           seq, &nout, NULL, NULL);
+}
+
+struct d2sgpu_wait_result {
+	uint64_t rc, js_status, fault_status, fault_addr, done_seq;
+};
+
+/* rc D2SGPU_JOB_TIMEOUT: not finished within timeout_us (0 = just look) */
+static inline kern_return_t
+d2sgpu_wait(io_connect_t c, uint64_t seq, uint32_t timeout_us, struct d2sgpu_wait_result *r)
+{
+	uint64_t in[2] = { seq, timeout_us };
+	uint32_t nout = 5;
+	return IOConnectCallMethod(c, D2SGPU_WAIT, in, 2, NULL, 0, &r->rc, &nout, NULL, NULL);
+}
+
+/* Wait for the buffer's last job, then make the GPU's writes visible to the
+ * CPU. Returns the job's rc, or D2SGPU_JOB_TIMEOUT. */
+static inline uint64_t
+d2sgpu_buf_wait(io_connect_t c, const struct d2sgpu_buf *b, uint32_t timeout_us)
+{
+	uint64_t in[2] = { b->handle, timeout_us }, rc = D2SGPU_JOB_INVALID;
+	uint32_t nout = 1;
+	IOConnectCallMethod(c, D2SGPU_BUF_WAIT, in, 2, NULL, 0, &rc, &nout, NULL, NULL);
+	return rc;
+}
+
+/* Map an IOSurface's own pages into the GPU (no CPU mapping is made here:
+ * the process uses the IOSurface's). */
+static inline kern_return_t
+d2sgpu_import_surface(io_connect_t c, uint32_t surface_id, uint32_t flags, struct d2sgpu_buf *b)
+{
+	uint64_t in[2] = { surface_id, flags }, out[3] = { 0 };
+	uint32_t nout = 3;
+	kern_return_t kr = IOConnectCallMethod(c, D2SGPU_IMPORT_SURFACE, in, 2, NULL, 0, out, &nout,
+	    NULL, NULL);
+	b->handle = (uint32_t)out[0];
+	b->gpu_va = out[1];
+	b->size = out[2];
+	b->cpu = NULL;
+	return kr;
 }
 
 #endif

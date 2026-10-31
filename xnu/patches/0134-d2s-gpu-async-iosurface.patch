@@ -1,0 +1,775 @@
+diff --git a/bsd/dev/d2s_gpu.c b/bsd/dev/d2s_gpu.c
+index 37b43dd..961aca5 100644
+--- a/bsd/dev/d2s_gpu.c
++++ b/bsd/dev/d2s_gpu.c
+@@ -29,6 +29,8 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+@@ -46,6 +48,7 @@ void d2s_gpu_start(void);
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ extern vm_map_address_t phystokv(uint64_t pa);
++extern void IOSleep(unsigned int milliseconds);
+ 
+ #define GPU_PA			0x18500000ull
+ #define GPU_SIZE		0x5000
+@@ -478,6 +481,8 @@ d2s_gpu_ctx_destroy(struct d2s_gpu_ctx *c)
+ 	if (c->as < 0) {
+ 		return;
+ 	}
++	/* queued jobs of this context must finish before its tables go */
++	(void)d2s_gpu_wait(c->last_seq, 3000000, NULL);
+ 	lck_mtx_lock(gpu_lock);
+ 	(void)as_op(c->as, 0, 0, AS_CMD_FLUSH_MEM);
+ 	gw(AS(c->as) + AS_TRANSTAB_LO, TRANSTAB_UNMAPPED);
+@@ -584,6 +589,11 @@ d2s_gpu_run(struct d2s_gpu_ctx *c, int js, uint64_t head, uint32_t timeout_us,
+ 			rc = D2S_GPU_JOB_DONE;
+ 			break;
+ 		}
++		/* no interrupts yet: spin for short jobs, then poll every ~1 ms
++		 * (gpu_lock is a mutex; sleeping with it held is allowed) */
++		if (now_us() - t0 > 200) {
++			IOSleep(1);
++		}
+ 	} while (now_us() - t0 < timeout_us);
+ 	r->us = (uint32_t)(now_us() - t0);
+ 	r->job_rawstat = raw;
+@@ -608,6 +618,145 @@ d2s_gpu_get_info(void)
+ 	return gpu_ready ? &info : NULL;
+ }
+ 
++/* ---- asynchronous jobs ----------------------------------------------- */
++
++/*
++ * One FIFO for every context; a worker thread runs the jobs in submission
++ * order, one at a time, so a job never starts before an earlier one (of any
++ * context) has finished. That is stricter than panfrost's dependencies, and
++ * simple. Each job gets a sequence number; results of the last QLEN jobs
++ * are kept by number for d2s_gpu_wait.
++ */
++#define QLEN		64
++#define JOB_TIMEOUT_US	2000000
++
++struct qjob {
++	struct d2s_gpu_ctx *c;
++	int js;
++	uint64_t head, seq;
++};
++
++struct qdone {
++	uint64_t seq;
++	int rc;
++	struct d2s_gpu_result r;
++};
++
++static lck_mtx_t *q_lock;
++static struct qjob q[QLEN];
++static struct qdone qdone[QLEN];
++static uint64_t submit_seq, done_seq;	/* under q_lock */
++
++static void
++q_worker(__unused void *arg, __unused wait_result_t wr)
++{
++	for (;;) {
++		lck_mtx_lock(q_lock);
++		while (done_seq == submit_seq) {
++			(void)lck_mtx_sleep(q_lock, LCK_SLEEP_DEFAULT, (event_t)&submit_seq, THREAD_UNINT);
++		}
++		struct qjob j = q[(done_seq + 1) % QLEN];
++		lck_mtx_unlock(q_lock);
++
++		struct d2s_gpu_result r;
++		int rc = d2s_gpu_run(j.c, j.js, j.head, JOB_TIMEOUT_US, &r);
++		if (rc != D2S_GPU_JOB_DONE) {
++			printf("D2S GPU: job %llu (AS%d) rc %d js status %#x fault %#x @ %#llx\n",
++			    j.seq, j.c->as, rc, r.js_status, r.fault_status, r.fault_addr);
++		}
++
++		lck_mtx_lock(q_lock);
++		struct qdone *d = &qdone[j.seq % QLEN];
++		d->seq = j.seq;
++		d->rc = rc;
++		d->r = r;
++		done_seq = j.seq;
++		thread_wakeup((event_t)&done_seq);
++		lck_mtx_unlock(q_lock);
++	}
++}
++
++/* Queue a job chain; *seq gets its number. Blocks while the queue is full. */
++int
++d2s_gpu_submit(struct d2s_gpu_ctx *c, int js, uint64_t head, uint64_t *seq)
++{
++	if (!gpu_ready || q_lock == NULL || c->as < 0 || js < 0 || js > 2 ||
++	    !(info.js_present & (1u << js))) {
++		return D2S_GPU_JOB_INVALID;
++	}
++	lck_mtx_lock(q_lock);
++	while (submit_seq - done_seq >= QLEN - 1) {
++		(void)lck_mtx_sleep(q_lock, LCK_SLEEP_DEFAULT, (event_t)&done_seq, THREAD_UNINT);
++	}
++	uint64_t s = ++submit_seq;
++	q[s % QLEN] = (struct qjob){ c, js, head, s };
++	c->last_seq = s;
++	thread_wakeup((event_t)&submit_seq);
++	lck_mtx_unlock(q_lock);
++	*seq = s;
++	return D2S_GPU_JOB_DONE;
++}
++
++/*
++ * Wait up to timeout_us (0: just look) for job seq. Returns its D2S_GPU_JOB_*
++ * result (DONE for a job too old to still have one), or TIMEOUT if it has
++ * not finished; r (may be NULL) gets its registers.
++ */
++int
++d2s_gpu_wait(uint64_t seq, uint32_t timeout_us, struct d2s_gpu_result *r)
++{
++	if (r != NULL) {
++		bzero(r, sizeof(*r));
++	}
++	if (q_lock == NULL || seq == 0) {
++		return D2S_GPU_JOB_DONE;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(timeout_us, NSEC_PER_USEC, &deadline);
++	lck_mtx_lock(q_lock);
++	if (seq > submit_seq) {
++		lck_mtx_unlock(q_lock);
++		return D2S_GPU_JOB_INVALID;
++	}
++	while (done_seq < seq) {
++		if (timeout_us == 0 || mach_absolute_time() >= deadline) {
++			lck_mtx_unlock(q_lock);
++			return D2S_GPU_JOB_TIMEOUT;
++		}
++		(void)lck_mtx_sleep_deadline(q_lock, LCK_SLEEP_DEFAULT, (event_t)&done_seq,
++		    THREAD_UNINT, deadline);
++	}
++	int rc = D2S_GPU_JOB_DONE;
++	struct qdone *d = &qdone[seq % QLEN];
++	if (d->seq == seq) {
++		rc = d->rc;
++		if (r != NULL) {
++			*r = d->r;
++		}
++	}
++	lck_mtx_unlock(q_lock);
++	return rc;
++}
++
++/* Number of the newest finished job. */
++uint64_t
++d2s_gpu_done_seq(void)
++{
++	return done_seq;
++}
++
++static bool
++q_start(void)
++{
++	q_lock = lck_mtx_alloc_init(gpu_lck_grp, LCK_ATTR_NULL);
++	thread_t th;
++	if (kernel_thread_start(q_worker, NULL, &th) != KERN_SUCCESS) {
++		return false;
++	}
++	thread_deallocate(th);
++	return true;
++}
++
+ /* ---- boot self-test -------------------------------------------------- */
+ 
+ /* genxml v7 Write Value Job: header 32 bytes + payload; 64 bytes each here */
+@@ -747,6 +896,10 @@ d2s_gpu_start(void)
+ 	}
+ 	gpu_ready = true;
+ 	printf("D2S GPU: ready (kernel page %u bytes)\n", (unsigned)PAGE_SIZE);
++	if (!q_start()) {
++		printf("D2S GPU: no job worker thread, async submit off\n");
++		q_lock = NULL;
++	}
+ 	if (test) {
+ 		self_test();
+ 	}
+diff --git a/bsd/dev/d2s_gpu.h b/bsd/dev/d2s_gpu.h
+index 1ae0825..4f39c45 100644
+--- a/bsd/dev/d2s_gpu.h
++++ b/bsd/dev/d2s_gpu.h
+@@ -37,6 +37,7 @@ struct d2s_gpu_ctx {
+ 	struct d2s_gpu_mem l0;
+ 	struct d2s_gpu_mem *tbl;	/* page-table pages below l0, for freeing */
+ 	uint32_t ntbl, captbl;
++	uint64_t last_seq;	/* newest queued job of this context */
+ };
+ 
+ struct d2s_gpu_result {
+@@ -74,6 +75,10 @@ void d2s_gpu_unmap(struct d2s_gpu_ctx *c, uint64_t va, uint64_t size);
+ bool d2s_gpu_ctx_bind(struct d2s_gpu_ctx *c);
+ int d2s_gpu_run(struct d2s_gpu_ctx *c, int js, uint64_t head, uint32_t timeout_us,
+     struct d2s_gpu_result *r);
++/* asynchronous: one in-order queue, results by sequence number */
++int d2s_gpu_submit(struct d2s_gpu_ctx *c, int js, uint64_t head, uint64_t *seq);
++int d2s_gpu_wait(uint64_t seq, uint32_t timeout_us, struct d2s_gpu_result *r);
++uint64_t d2s_gpu_done_seq(void);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/iokit/Kernel/arm/D2SGPU.cpp b/iokit/Kernel/arm/D2SGPU.cpp
+index 5e91b2f..b49e06a 100644
+--- a/iokit/Kernel/arm/D2SGPU.cpp
++++ b/iokit/Kernel/arm/D2SGPU.cpp
+@@ -1,30 +1,43 @@
+ /*
+  * Galaxy Note 10+ (d2s): user-space interface to the Mali-G76 driver core
+- * (bsd/dev/d2s_gpu.c). GPU step 3b.
++ * (bsd/dev/d2s_gpu.c). GPU steps 3b and 3c.
+  *
+  * IOServiceOpen(IOServiceMatching("D2SGPU"), mach_task_self(), 0, &conn)
+  * gives a process its own GPU context: a hardware address space and page
+- * tables. Buffers are wired kernel memory mapped into that GPU address
+- * space and, with IOConnectMapMemory64(conn, handle, ...), into the
+- * process. Selectors (IOConnectCall*Method):
++ * tables. Buffers are wired kernel memory (or an imported IOSurface) mapped
++ * into that GPU address space and, with IOConnectMapMemory64(conn, handle,
++ * ...), into the process. Selectors (IOConnectCall*Method):
+  *
+- *   0 GET_INFO      struct out  struct d2s_gpu_uinfo
+- *   1 BUF_CREATE    in  size, flags (1 GPU write, 2 GPU exec)
+- *                   out handle, GPU address, size (4 KiB multiple)
+- *   2 BUF_DESTROY   in  handle (process mappings keep the memory alive)
+- *   3 SUBMIT        in  job slot, GPU address of the first job, timeout us
+- *                   out rc (0 done, 1 job error, 2 MMU fault, 3 timeout,
+- *                   4 invalid), us, JS status, fault status, fault
+- *                   address, reset ok
+- *   4 LOG           struct in  text, written to the kernel log
++ *   0 GET_INFO        struct out  struct d2s_gpu_uinfo
++ *   1 BUF_CREATE      in  size, flags (1 GPU write, 2 GPU exec)
++ *                     out handle, GPU address, size (4 KiB multiple)
++ *   2 BUF_DESTROY     in  handle; waits for the buffer's last job first
++ *   3 SUBMIT          in  job slot, GPU address of the first job, timeout us
++ *                     out rc (0 done, 1 job error, 2 MMU fault, 3 timeout,
++ *                     4 invalid), us, JS status, fault status, fault
++ *                     address, reset ok. Synchronous; flushes every buffer.
++ *   4 LOG             struct in  text, written to the kernel log
++ *   5 SUBMIT_ASYNC    in  job slot, GPU address of the first job
++ *                     struct in  u32 handles of the buffers the job uses
++ *                     out sequence number. Returns at once; the listed
++ *                     buffers are written back from the CPU caches first.
++ *   6 WAIT            in  sequence number, timeout us (0: just look)
++ *                     out rc (as SUBMIT; 3 = not finished yet), JS status,
++ *                     fault status, fault address, newest finished number
++ *   7 BUF_WAIT        in  handle, timeout us
++ *                     out rc. Waits for the buffer's last job, then drops
++ *                     the buffer from the CPU caches so the CPU reads what
++ *                     the GPU wrote (panfrost WAIT_BO + CPU prep).
++ *   8 IMPORT_SURFACE  in  IOSurface id, flags   out handle, GPU address,
++ *                     size. Maps the surface's own pages: no copy.
+  *
+- * SUBMIT is synchronous (completion is polled; no interrupts yet) and
+- * writes back and invalidates every buffer of the context around the job,
+- * since the GPU does not snoop CPU caches. GPU addresses come from
+- * [32 MiB, 4 GiB) with a guard page between buffers, like Linux panfrost.
++ * Jobs of all processes run in one queue, in submission order (the driver
++ * core's worker; completion is polled, no interrupts yet). GPU addresses come
++ * from [32 MiB, 4 GiB) with a guard page between buffers, like Linux
++ * panfrost.
+  *
+- * At boot, a thread runs the same buffer and submit path once from the
+- * kernel and logs "D2S GPU UC: BOOT TEST ...".
++ * At boot, a thread runs the buffer and submit paths once from the kernel
++ * and logs "D2S GPU UC: BOOT TEST ...".
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -37,6 +50,7 @@
+ #include <kern/thread.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/proc.h>
++#include "SweetSurface.h"
+ #include "../../../bsd/dev/d2s_gpu.h"
+ 
+ #define GPAGE		4096u
+@@ -44,10 +58,11 @@
+ #define VA_END		(4ull << 30)
+ #define MAX_BUFS	1024u
+ #define MAX_BUF_SIZE	(256u << 20)
++#define MAX_SUBMIT_BUFS	256u
+ 
+ /* GET_INFO payload; same layout in user space (tools/d2s-gpu/d2sgpu.h) */
+ struct d2s_gpu_uinfo {
+-	uint32_t version;		/* 1 */
++	uint32_t version;		/* 2: async submit and IOSurface import */
+ 	uint32_t gpu_id;
+ 	uint32_t mmu_features;
+ 	uint32_t as_present;
+@@ -61,8 +76,11 @@ struct d2s_gpu_uinfo {
+ /* ---- one GPU address space with its buffers ------------------------- */
+ 
+ struct D2SGPUBuf {
+-	IOBufferMemoryDescriptor *md;	/* NULL = free slot */
++	IOMemoryDescriptor *md;		/* NULL = free slot */
++	OSObject *owner;		/* imported surface, or NULL */
++	vm_offset_t kva;		/* cached kernel view to flush, or 0 */
+ 	uint64_t gva;
++	uint64_t last_seq;		/* newest job that used it */
+ 	uint32_t size;
+ 	uint32_t flags;
+ };
+@@ -73,13 +91,19 @@ public:
+ 	void destroy(void);
+ 	IOReturn create(uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *gva,
+ 	    uint64_t *out_size);
++	IOReturn importSurface(uint32_t surface_id, uint32_t flags, uint32_t *handle,
++	    uint64_t *gva, uint64_t *out_size);
+ 	IOReturn destroyBuf(uint32_t handle);
+-	IOBufferMemoryDescriptor *buffer(uint32_t handle);	/* retained */
++	IOMemoryDescriptor *buffer(uint32_t handle);	/* retained */
+ 	int submit(int js, uint64_t head, uint32_t timeout_us, struct d2s_gpu_result *r);
++	int submitAsync(int js, uint64_t head, const uint32_t *handles, uint32_t n, uint64_t *seq);
++	int waitBuf(uint32_t handle, uint32_t timeout_us);
+ 	int as(void) const { return ctx.as; }
+ 
+ private:
+ 	uint64_t findVA(uint64_t size);
++	IOReturn addMapped(IOMemoryDescriptor *md, OSObject *owner, vm_offset_t kva,
++	    uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *gva);
+ 	void flushAll(void);
+ 
+ 	IOLock *lock;
+@@ -110,6 +134,10 @@ void
+ D2SGPUSpace::destroy(void)
+ {
+ 	if (bufs != NULL) {
++		/* d2s_gpu_ctx_destroy waits for the context's jobs; buffers go after */
++		if (ready) {
++			(void)d2s_gpu_wait(ctx.last_seq, 3000000, NULL);
++		}
+ 		for (uint32_t i = 0; i < MAX_BUFS; i++) {
+ 			if (bufs[i].md != NULL) {
+ 				(void)destroyBuf(i + 1);
+@@ -154,34 +182,25 @@ D2SGPUSpace::findVA(uint64_t size)
+ 	return cand;
+ }
+ 
++/* Map md's first size bytes (4 KiB multiple) at a free GPU address and take
++ * a slot; md and owner are retained by the slot on success. */
+ IOReturn
+-D2SGPUSpace::create(uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *gva,
+-    uint64_t *out_size)
++D2SGPUSpace::addMapped(IOMemoryDescriptor *md, OSObject *owner, vm_offset_t kva,
++    uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *gva)
+ {
+-	if (!ready || size == 0 || size > MAX_BUF_SIZE || (flags & ~3u)) {
+-		return kIOReturnBadArgument;
+-	}
+-	/* whole kernel pages: a process maps whole pages, so nothing else may
+-	 * share the last one */
+-	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+-	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(
+-		kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
+-	if (md == NULL) {
+-		return kIOReturnNoMemory;
+-	}
+ 	uint32_t npages = (uint32_t)(size / GPAGE);
+ 	uint64_t *pas = IONew(uint64_t, npages);
+ 	if (pas == NULL) {
+-		md->release();
+ 		return kIOReturnNoMemory;
+ 	}
+ 	for (uint32_t i = 0; i < npages; i++) {
+ 		IOByteCount len = 0;
+ 		pas[i] = md->getPhysicalSegment((IOByteCount)i * GPAGE, &len, kIOMemoryMapperNone);
++		if (pas[i] == 0 || (pas[i] & (GPAGE - 1))) {
++			IODelete(pas, uint64_t, npages);
++			return kIOReturnNotAligned;
++		}
+ 	}
+-	bzero(md->getBytesNoCopy(), size);
+-	d2s_gpu_flush((vm_offset_t)md->getBytesNoCopy(), (uint32_t)size);
+-
+ 	IOReturn ret = kIOReturnNoSpace;
+ 	IOLockLock(lock);
+ 	uint32_t slot = MAX_BUFS;
+@@ -194,14 +213,13 @@ D2SGPUSpace::create(uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *g
+ 	uint64_t va = slot < MAX_BUFS ? findVA(size) : 0;
+ 	if (va != 0) {
+ 		if (d2s_gpu_map_pages(&ctx, va, pas, npages, flags)) {
+-			bufs[slot].md = md;
+-			bufs[slot].gva = va;
+-			bufs[slot].size = (uint32_t)size;
+-			bufs[slot].flags = flags;
++			md->retain();
++			if (owner != NULL) {
++				owner->retain();
++			}
++			bufs[slot] = D2SGPUBuf{ md, owner, kva, va, 0, (uint32_t)size, flags };
+ 			*handle = slot + 1;
+ 			*gva = va;
+-			*out_size = size;
+-			md = NULL;
+ 			ret = kIOReturnSuccess;
+ 		} else {
+ 			d2s_gpu_unmap(&ctx, va, size);
+@@ -210,35 +228,102 @@ D2SGPUSpace::create(uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *g
+ 	}
+ 	IOLockUnlock(lock);
+ 	IODelete(pas, uint64_t, npages);
+-	if (md != NULL) {
+-		md->release();
++	return ret;
++}
++
++IOReturn
++D2SGPUSpace::create(uint64_t size, uint32_t flags, uint32_t *handle, uint64_t *gva,
++    uint64_t *out_size)
++{
++	if (!ready || size == 0 || size > MAX_BUF_SIZE || (flags & ~3u)) {
++		return kIOReturnBadArgument;
++	}
++	/* whole kernel pages: a process maps whole pages, so nothing else may
++	 * share the last one */
++	size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(
++		kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, size, PAGE_SIZE);
++	if (md == NULL) {
++		return kIOReturnNoMemory;
++	}
++	vm_offset_t kva = (vm_offset_t)md->getBytesNoCopy();
++	bzero((void *)kva, size);
++	d2s_gpu_flush(kva, (uint32_t)size);
++	IOReturn ret = addMapped(md, NULL, kva, size, flags, handle, gva);
++	md->release();
++	if (ret == kIOReturnSuccess) {
++		*out_size = size;
+ 	}
+ 	return ret;
+ }
+ 
++IOReturn
++D2SGPUSpace::importSurface(uint32_t surface_id, uint32_t flags, uint32_t *handle,
++    uint64_t *gva, uint64_t *out_size)
++{
++	if (!ready || (flags & ~3u)) {
++		return kIOReturnBadArgument;
++	}
++	SweetSurface *s = sweet_surface_copy(surface_id);
++	if (s == NULL) {
++		return kIOReturnNotFound;
++	}
++	IOReturn ret = kIOReturnBadArgument;
++	uint64_t size = ((uint64_t)s->allocSize + GPAGE - 1) & ~(uint64_t)(GPAGE - 1);
++	if (s->memory != NULL && size != 0 && size <= MAX_BUF_SIZE &&
++	    s->memory->getLength() >= s->allocSize) {
++		/* a buffer surface has a cached kernel view to flush; the panel
++		 * surface is physical memory that every user maps uncached */
++		IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++		vm_offset_t kva = bmd != NULL ? (vm_offset_t)bmd->getBytesNoCopy() : 0;
++		if (bmd != NULL && bmd->getCapacity() < size) {
++			size = bmd->getCapacity() & ~(uint64_t)(GPAGE - 1);
++		}
++		ret = addMapped(s->memory, s, kva, size, flags, handle, gva);
++		if (ret == kIOReturnSuccess) {
++			*out_size = size;
++		}
++	}
++	s->release();
++	return ret;
++}
++
+ IOReturn
+ D2SGPUSpace::destroyBuf(uint32_t handle)
+ {
+-	IOBufferMemoryDescriptor *md = NULL;
++	if (handle < 1 || handle > MAX_BUFS) {
++		return kIOReturnBadArgument;
++	}
+ 	IOLockLock(lock);
+-	if (handle >= 1 && handle <= MAX_BUFS && bufs[handle - 1].md != NULL) {
+-		D2SGPUBuf *b = &bufs[handle - 1];
+-		d2s_gpu_unmap(&ctx, b->gva, b->size);
+-		md = b->md;
+-		bzero(b, sizeof(*b));
++	uint64_t seq = bufs[handle - 1].md != NULL ? bufs[handle - 1].last_seq : 0;
++	bool present = bufs[handle - 1].md != NULL;
++	IOLockUnlock(lock);
++	if (!present) {
++		return kIOReturnBadArgument;
++	}
++	(void)d2s_gpu_wait(seq, 3000000, NULL);	/* the GPU may still use it */
++
++	IOLockLock(lock);
++	D2SGPUBuf b = bufs[handle - 1];
++	if (b.md != NULL) {
++		d2s_gpu_unmap(&ctx, b.gva, b.size);
++		bzero(&bufs[handle - 1], sizeof(D2SGPUBuf));
+ 	}
+ 	IOLockUnlock(lock);
+-	if (md == NULL) {
++	if (b.md == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	md->release();
++	b.md->release();
++	if (b.owner != NULL) {
++		b.owner->release();
++	}
+ 	return kIOReturnSuccess;
+ }
+ 
+-IOBufferMemoryDescriptor *
++IOMemoryDescriptor *
+ D2SGPUSpace::buffer(uint32_t handle)
+ {
+-	IOBufferMemoryDescriptor *md = NULL;
++	IOMemoryDescriptor *md = NULL;
+ 	IOLockLock(lock);
+ 	if (handle >= 1 && handle <= MAX_BUFS && bufs[handle - 1].md != NULL) {
+ 		md = bufs[handle - 1].md;
+@@ -253,8 +338,8 @@ void
+ D2SGPUSpace::flushAll(void)
+ {
+ 	for (uint32_t i = 0; i < MAX_BUFS; i++) {
+-		if (bufs[i].md != NULL) {
+-			d2s_gpu_flush((vm_offset_t)bufs[i].md->getBytesNoCopy(), bufs[i].size);
++		if (bufs[i].md != NULL && bufs[i].kva != 0) {
++			d2s_gpu_flush(bufs[i].kva, bufs[i].size);
+ 		}
+ 	}
+ }
+@@ -277,6 +362,57 @@ D2SGPUSpace::submit(int js, uint64_t head, uint32_t timeout_us, struct d2s_gpu_r
+ 	return rc;
+ }
+ 
++int
++D2SGPUSpace::submitAsync(int js, uint64_t head, const uint32_t *handles, uint32_t n,
++    uint64_t *seq)
++{
++	if (!ready) {
++		return D2S_GPU_JOB_INVALID;
++	}
++	IOLockLock(lock);
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t h = handles[i];
++		if (h >= 1 && h <= MAX_BUFS && bufs[h - 1].md != NULL && bufs[h - 1].kva != 0) {
++			d2s_gpu_flush(bufs[h - 1].kva, bufs[h - 1].size);
++		}
++	}
++	int rc = d2s_gpu_submit(&ctx, js, head, seq);
++	if (rc == D2S_GPU_JOB_DONE) {
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t h = handles[i];
++			if (h >= 1 && h <= MAX_BUFS && bufs[h - 1].md != NULL) {
++				bufs[h - 1].last_seq = *seq;
++			}
++		}
++	}
++	IOLockUnlock(lock);
++	return rc;
++}
++
++int
++D2SGPUSpace::waitBuf(uint32_t handle, uint32_t timeout_us)
++{
++	if (handle < 1 || handle > MAX_BUFS) {
++		return D2S_GPU_JOB_INVALID;
++	}
++	IOLockLock(lock);
++	bool present = bufs[handle - 1].md != NULL;
++	uint64_t seq = bufs[handle - 1].last_seq;
++	IOLockUnlock(lock);
++	if (!present) {
++		return D2S_GPU_JOB_INVALID;
++	}
++	int rc = d2s_gpu_wait(seq, timeout_us, NULL);
++	if (rc != D2S_GPU_JOB_TIMEOUT) {
++		IOLockLock(lock);
++		if (bufs[handle - 1].md != NULL && bufs[handle - 1].kva != 0) {
++			d2s_gpu_flush(bufs[handle - 1].kva, bufs[handle - 1].size);
++		}
++		IOLockUnlock(lock);
++	}
++	return rc;
++}
++
+ /* ---- the service ----------------------------------------------------- */
+ 
+ class D2SGPU : public IOService {
+@@ -321,7 +457,7 @@ uc_write_value_job(uint32_t *j, uint64_t dst, uint32_t value)
+ 	j[12] = value;
+ }
+ 
+-/* The user-client path, driven from the kernel once the GPU is up. */
++/* The user-client paths, driven from the kernel once the GPU is up. */
+ void
+ D2SGPU::bootTest(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -336,7 +472,7 @@ D2SGPU::bootTest(__unused void *arg, __unused wait_result_t wr)
+ 	uint32_t hjob = 0, hres = 0, hres2 = 0;
+ 	uint64_t gjob = 0, gres = 0, gres2 = 0, sz = 0;
+ 	struct d2s_gpu_result r;
+-	bool ok = false, reuse = false;
++	bool ok = false, reuse = false, async_ok = false;
+ 	int rc = -1;
+ 	if (!s.init()) {
+ 		IOLog("D2S GPU UC: BOOT TEST FAIL, no context\n");
+@@ -344,16 +480,38 @@ D2SGPU::bootTest(__unused void *arg, __unused wait_result_t wr)
+ 	    s.create(64 * 1024, 1, &hres, &gres, &sz) != kIOReturnSuccess) {
+ 		IOLog("D2S GPU UC: BOOT TEST FAIL, buffer create\n");
+ 	} else {
+-		IOBufferMemoryDescriptor *jm = s.buffer(hjob), *rm = s.buffer(hres);
++		IOBufferMemoryDescriptor *jm = OSDynamicCast(IOBufferMemoryDescriptor, s.buffer(hjob));
++		IOBufferMemoryDescriptor *rm = OSDynamicCast(IOBufferMemoryDescriptor, s.buffer(hres));
+ 		uint32_t *job = (uint32_t *)jm->getBytesNoCopy();
+ 		volatile uint32_t *res = (volatile uint32_t *)rm->getBytesNoCopy();
+-		/* last page of a 16-page buffer: crosses kernel pages if they are 4 KiB */
++		/* synchronous: last page of a 16-page buffer */
+ 		uc_write_value_job(job, gres + 60 * 1024, 0xD25B0001u);
+ 		res[60 * 1024 / 4] = 0x33333333u;
+ 		rc = s.submit(0, gjob, 100000, &r);
+ 		ok = rc == D2S_GPU_JOB_DONE && res[60 * 1024 / 4] == 0xD25B0001u;
+ 		IOLog("D2S GPU UC: job rc %d in %u us, result %#x, AS%d, job %#llx res %#llx\n",
+ 		    rc, r.us, res[60 * 1024 / 4], s.as(), gjob, gres);
++
++		/* asynchronous: 8 jobs on slot 1 in one go, each its own descriptor
++		 * and result word, then wait for the result buffer */
++		uint32_t handles[2] = { hjob, hres };
++		uint64_t seq[8] = { 0 };
++		for (int i = 0; i < 8; i++) {
++			uc_write_value_job(job + 16 * (i + 1), gres + 0x100 + 4 * i, 0xD25B0100u + i);
++			res[0x100 / 4 + i] = 0;
++		}
++		bool queued = true;
++		for (int i = 0; i < 8 && queued; i++) {
++			queued = s.submitAsync(1, gjob + 64 * (i + 1), handles, 2, &seq[i]) == D2S_GPU_JOB_DONE;
++		}
++		int wrc = queued ? s.waitBuf(hres, 1000000) : -1;
++		int good = 0;
++		for (int i = 0; i < 8; i++) {
++			good += res[0x100 / 4 + i] == 0xD25B0100u + (uint32_t)i;
++		}
++		async_ok = queued && wrc == D2S_GPU_JOB_DONE && good == 8 && seq[7] == seq[0] + 7;
++		IOLog("D2S GPU UC: async 8 jobs seq %llu..%llu, wait rc %d, %d/8 results, done seq %llu\n",
++		    seq[0], seq[7], wrc, good, d2s_gpu_done_seq());
+ 		jm->release();
+ 		rm->release();
+ 		/* a freed range is found again */
+@@ -362,8 +520,9 @@ D2SGPU::bootTest(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	int as = s.as();
+ 	s.destroy();
+-	IOLog("D2S GPU UC: BOOT TEST %s (job %s, VA reuse %s, AS%d released)\n",
+-	    ok && reuse ? "OK" : "FAIL", ok ? "ok" : "FAIL", reuse ? "ok" : "FAIL", as);
++	IOLog("D2S GPU UC: BOOT TEST %s (job %s, async %s, VA reuse %s, AS%d released)\n",
++	    ok && async_ok && reuse ? "OK" : "FAIL", ok ? "ok" : "FAIL", async_ok ? "ok" : "FAIL",
++	    reuse ? "ok" : "FAIL", as);
+ }
+ 
+ /* ---- the user client ------------------------------------------------- */
+@@ -444,7 +603,7 @@ IOReturn
+ D2SGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+     IOMemoryDescriptor **memory)
+ {
+-	IOBufferMemoryDescriptor *md = space != NULL ? space->buffer(type) : NULL;
++	IOMemoryDescriptor *md = space != NULL ? space->buffer(type) : NULL;
+ 	if (md == NULL) {
+ 		return kIOReturnBadArgument;
+ 	}
+@@ -453,6 +612,16 @@ D2SGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options,
+ 	return kIOReturnSuccess;
+ }
+ 
++static void
++fill_result(IOExternalMethodArguments *a, int rc, const struct d2s_gpu_result *r)
++{
++	a->scalarOutput[0] = (uint64_t)rc;
++	a->scalarOutput[1] = r->js_status;
++	a->scalarOutput[2] = r->fault_status;
++	a->scalarOutput[3] = r->fault_addr;
++	a->scalarOutput[4] = d2s_gpu_done_seq();
++}
++
+ IOReturn
+ D2SGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -468,7 +637,7 @@ D2SGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+ 		if (a->structureOutput == NULL || a->structureOutputSize < sizeof(u) || gi == NULL) {
+ 			return kIOReturnBadArgument;
+ 		}
+-		u.version = 1;
++		u.version = 2;
+ 		u.gpu_id = gi->gpu_id;
+ 		u.mmu_features = gi->mmu_features;
+ 		u.as_present = gi->as_present;
+@@ -481,16 +650,24 @@ D2SGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+ 		a->structureOutputSize = sizeof(u);
+ 		return kIOReturnSuccess;
+ 	}
+-	case 1: {	/* BUF_CREATE */
++	case 1:		/* BUF_CREATE */
++	case 8: {	/* IMPORT_SURFACE */
+ 		if (a->scalarInputCount != 2 || a->scalarOutputCount != 3) {
+ 			return kIOReturnBadArgument;
+ 		}
+ 		uint32_t h = 0;
+ 		uint64_t va = 0, size = 0;
+-		IOReturn ret = space->create(a->scalarInput[0], (uint32_t)a->scalarInput[1], &h, &va, &size);
++		IOReturn ret = selector == 1 ?
++		    space->create(a->scalarInput[0], (uint32_t)a->scalarInput[1], &h, &va, &size) :
++		    space->importSurface((uint32_t)a->scalarInput[0], (uint32_t)a->scalarInput[1], &h,
++		    &va, &size);
+ 		a->scalarOutput[0] = h;
+ 		a->scalarOutput[1] = va;
+ 		a->scalarOutput[2] = size;
++		if (selector == 8) {
++			IOLog("D2S GPU UC: %s: import surface %llu -> buf %u gpu %#llx size %#llx (%#x)\n",
++			    name, a->scalarInput[0], h, va, size, ret);
++		}
+ 		return ret;
+ 	}
+ 	case 2:		/* BUF_DESTROY */
+@@ -529,6 +706,39 @@ D2SGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+ 		IOLog("D2S GPU UC: %s: %s\n", name, text);
+ 		return kIOReturnSuccess;
+ 	}
++	case 5: {	/* SUBMIT_ASYNC */
++		uint32_t n = a->structureInputSize / 4;
++		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1 || n > MAX_SUBMIT_BUFS ||
++		    (n && a->structureInput == NULL)) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t handles[MAX_SUBMIT_BUFS];
++		if (n) {
++			bcopy(a->structureInput, handles, n * 4);
++		}
++		uint64_t seq = 0;
++		int rc = space->submitAsync((int)a->scalarInput[0], a->scalarInput[1], handles, n, &seq);
++		a->scalarOutput[0] = seq;
++		return rc == D2S_GPU_JOB_DONE ? kIOReturnSuccess : kIOReturnBadArgument;
++	}
++	case 6: {	/* WAIT */
++		if (a->scalarInputCount != 2 || a->scalarOutputCount != 5) {
++			return kIOReturnBadArgument;
++		}
++		struct d2s_gpu_result r;
++		uint32_t t = a->scalarInput[1] > 5000000 ? 5000000 : (uint32_t)a->scalarInput[1];
++		int rc = d2s_gpu_wait(a->scalarInput[0], t, &r);
++		fill_result(a, rc, &r);
++		return kIOReturnSuccess;
++	}
++	case 7: {	/* BUF_WAIT */
++		if (a->scalarInputCount != 2 || a->scalarOutputCount != 1) {
++			return kIOReturnBadArgument;
++		}
++		uint32_t t = a->scalarInput[1] > 5000000 ? 5000000 : (uint32_t)a->scalarInput[1];
++		a->scalarOutput[0] = (uint64_t)space->waitBuf((uint32_t)a->scalarInput[0], t);
++		return kIOReturnSuccess;
++	}
+ 	default:
+ 		return kIOReturnUnsupported;
+ 	}

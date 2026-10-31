@@ -28,6 +28,7 @@ int d2sdrm_surface_fd(int drm_fd, uint32_t iosurface_id);
  * panfrost buffers: buffers are mapped once, when created or imported. */
 void *d2sdrm_mmap(int drm_fd, off_t offset, size_t size);
 int d2sdrm_munmap(void *addr, size_t size);
+uint64_t d2sdrm_bo_size(int drm_fd, uint32_t handle);
 
 /* One line into the kernel log ("D2S GPU UC: <process>: ..."). */
 void d2sdrm_log(int drm_fd, const char *fmt, ...) __attribute__((format(printf, 2, 3)));

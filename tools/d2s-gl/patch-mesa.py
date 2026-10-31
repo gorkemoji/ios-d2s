@@ -20,6 +20,7 @@ from pathlib import Path
 DECL = ('#if defined(__APPLE__)\n'
         'void *d2sdrm_mmap(int drm_fd, off_t offset, size_t size);\n'
         'int d2sdrm_munmap(void *addr, size_t size);\n'
+        'uint64_t d2sdrm_bo_size(int drm_fd, uint32_t handle);\n'
         '#endif\n')
 
 EDITS = [
@@ -57,6 +58,15 @@ EDITS = [
      '   (void)caps;\n   (void)backend;\n   return NULL;\n'
      '#endif\n'
      '   session = pan_kmod_dev_alloc(dev, sizeof(*session));\n'),
+    # An imported buffer's size: Linux seeks to the end of the dma-buf fd;
+    # d2sdrm's import descriptors are placeholders, so ask d2sdrm.
+    ('src/panfrost/lib/kmod/pan_kmod.c',
+     '      size_t size = lseek(fd, 0, SEEK_END);\n',
+     '#if defined(__APPLE__)\n'
+     '      size_t size = (size_t)d2sdrm_bo_size(dev->fd, handle);\n'
+     '#else\n'
+     '      size_t size = lseek(fd, 0, SEEK_END);\n'
+     '#endif\n'),
     ('src/gallium/drivers/panfrost/pan_bo.c',
      '   if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {',
      '#if defined(__APPLE__)\n'

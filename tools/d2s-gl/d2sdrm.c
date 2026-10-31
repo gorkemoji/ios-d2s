@@ -303,6 +303,18 @@ drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 	return ret;
 }
 
+/* Size of a buffer (Mesa asks this for imports instead of seeking a dma-buf
+ * fd; see patch-mesa.py); 0 if there is no such buffer. */
+uint64_t
+d2sdrm_bo_size(int fd, uint32_t handle)
+{
+	pthread_mutex_lock(&lock);
+	struct bo *bo = is_dev(fd) ? bo_get(handle) : NULL;
+	uint64_t size = bo != NULL ? bo->buf.size : 0;
+	pthread_mutex_unlock(&lock);
+	return size;
+}
+
 int
 drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 {

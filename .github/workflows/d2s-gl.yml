@@ -1,0 +1,35 @@
+name: d2s-gl
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'tools/d2s-gl/**'
+      - 'tools/d2s-gpu/d2sgpu.h'
+      - '.github/workflows/d2s-gl.yml'
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tools
+        run: |
+          brew install meson ninja bison flex pkgconf llvm spirv-llvm-translator spirv-tools libclc
+          python3 -m pip install --break-system-packages mako pyyaml packaging
+      - name: Build Mesa panfrost for iOS and pantest.dylib
+        run: bash tools/d2s-gl/build.sh 2>&1 | tee tools/d2s-gl/out-build.log
+        shell: bash
+      - name: Errors
+        if: always()
+        run: grep -E 'error:|ERROR:|FAILED' tools/d2s-gl/out-build.log | sort | uniq -c | sort -rn | head -60 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: d2s-gl
+          path: |
+            tools/d2s-gl/out/
+            tools/d2s-gl/out-build.log
+            tools/d2s-gl/work/native/meson-logs/meson-log.txt
+            tools/d2s-gl/work/ios/meson-logs/meson-log.txt

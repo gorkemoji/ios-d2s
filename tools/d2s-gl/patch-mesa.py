@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Apply the d2s changes to a Mesa source tree (checked against mesa-26.2.6).
+
+  patch-mesa.py MESA_DIR
+
+panfrost buffers are mapped once by d2sdrm (tools/d2s-gl/d2sdrm.c), when
+they are created or imported, so on Apple platforms:
+  - pan_kmod_bo_mmap() asks d2sdrm_mmap() for that mapping instead of
+    mmap()ing the "DRM fd" (there is no such file to map)
+  - panfrost_bo_munmap() leaves it alone (d2sdrm_munmap() is a no-op; the
+    mapping goes when the buffer is closed)
+Each replacement must match exactly once, so a Mesa update that moves the
+code fails here instead of building something different. Idempotent.
+"""
+import sys
+from pathlib import Path
+
+DECL = ('#if defined(__APPLE__)\n'
+        'void *d2sdrm_mmap(int drm_fd, off_t offset, size_t size);\n'
+        'int d2sdrm_munmap(void *addr, size_t size);\n'
+        '#endif\n')
+
+EDITS = [
+    ('src/panfrost/lib/kmod/pan_kmod.h',
+     '   host_addr =\n      os_mmap(host_addr, bo->size, prot, flags, bo->dev->fd, mmap_offset);\n',
+     '#if defined(__APPLE__)\n'
+     '   (void)prot;\n   (void)flags;\n'
+     '   host_addr = d2sdrm_mmap(bo->dev->fd, mmap_offset, bo->size);\n'
+     '#else\n'
+     '   host_addr =\n      os_mmap(host_addr, bo->size, prot, flags, bo->dev->fd, mmap_offset);\n'
+     '#endif\n'),
+    ('src/panfrost/lib/kmod/pan_kmod.h',
+     'static inline void *\npan_kmod_bo_mmap(',
+     DECL + '\nstatic inline void *\npan_kmod_bo_mmap('),
+    ('src/gallium/drivers/panfrost/pan_bo.c',
+     '   if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {',
+     '#if defined(__APPLE__)\n'
+     '   if (d2sdrm_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {\n'
+     '#else\n'
+     '   if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {\n'
+     '#endif'),
+]
+
+
+def main():
+    root = Path(sys.argv[1])
+    for rel, old, new in EDITS:
+        p = root / rel
+        s = p.read_text()
+        if new in s:
+            print(f'{rel}: already applied')
+            continue
+        n = s.count(old)
+        if n != 1:
+            sys.exit(f'{rel}: expected 1 match, found {n}')
+        p.write_text(s.replace(old, new))
+        print(f'{rel}: patched')
+
+
+if __name__ == '__main__':
+    main()

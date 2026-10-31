@@ -1,0 +1,8 @@
+prefix=@PREFIX@
+includedir=${prefix}
+
+Name: libdrm
+Description: d2s stand-in for libdrm (tools/d2s-gl/d2sdrm.c over D2SGPU)
+Version: 2.4.125
+Cflags: -I${includedir}
+Libs:

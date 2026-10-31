@@ -1,0 +1,117 @@
+diff --git a/bsd/dev/d2s_gpu.c b/bsd/dev/d2s_gpu.c
+index 961aca5..a697ac9 100644
+--- a/bsd/dev/d2s_gpu.c
++++ b/bsd/dev/d2s_gpu.c
+@@ -618,6 +618,21 @@ d2s_gpu_get_info(void)
+ 	return gpu_ready ? &info : NULL;
+ }
+ 
++/*
++ * Read one register of the GPU control page (offset < 0x1000, 4-byte
++ * aligned): the ID and feature registers Mesa asks for through panfrost's
++ * GET_PARAM. Reads have no side effects there. Returns false otherwise.
++ */
++bool
++d2s_gpu_read_reg(uint32_t off, uint32_t *val)
++{
++	if (!gpu_ready || off >= 0x1000 || (off & 3)) {
++		return false;
++	}
++	*val = gr(off);
++	return true;
++}
++
+ /* ---- asynchronous jobs ----------------------------------------------- */
+ 
+ /*
+diff --git a/bsd/dev/d2s_gpu.h b/bsd/dev/d2s_gpu.h
+index 4f39c45..f8fa4f5 100644
+--- a/bsd/dev/d2s_gpu.h
++++ b/bsd/dev/d2s_gpu.h
+@@ -61,6 +61,7 @@ struct d2s_gpu_result {
+ #define D2S_GPU_JOB_INVALID	4
+ 
+ const struct d2s_gpu_info *d2s_gpu_get_info(void);	/* NULL until the GPU is up */
++bool d2s_gpu_read_reg(uint32_t off, uint32_t *val);	/* GPU control page, < 0x1000 */
+ bool d2s_gpu_alloc(uint32_t size, struct d2s_gpu_mem *m);
+ void d2s_gpu_free(struct d2s_gpu_mem *m);
+ void d2s_gpu_flush(vm_offset_t va, uint32_t len);	/* write back + invalidate */
+diff --git a/iokit/Kernel/arm/D2SGPU.cpp b/iokit/Kernel/arm/D2SGPU.cpp
+index b49e06a..9de4deb 100644
+--- a/iokit/Kernel/arm/D2SGPU.cpp
++++ b/iokit/Kernel/arm/D2SGPU.cpp
+@@ -30,6 +30,11 @@
+  *                     the GPU wrote (panfrost WAIT_BO + CPU prep).
+  *   8 IMPORT_SURFACE  in  IOSurface id, flags   out handle, GPU address,
+  *                     size. Maps the surface's own pages: no copy.
++ *   9 READ_REGS       struct in  u32 offsets (up to 64) in the GPU control
++ *                     page (< 0x1000)   struct out  u32 values. The ID and
++ *                     feature registers behind panfrost's GET_PARAM.
++ *  10 BUF_FLUSH       in  handle. Write back and drop the buffer's CPU
++ *                     cache lines now (panfrost SYNC_BO).
+  *
+  * Jobs of all processes run in one queue, in submission order (the driver
+  * core's worker; completion is polled, no interrupts yet). GPU addresses come
+@@ -98,6 +103,7 @@ public:
+ 	int submit(int js, uint64_t head, uint32_t timeout_us, struct d2s_gpu_result *r);
+ 	int submitAsync(int js, uint64_t head, const uint32_t *handles, uint32_t n, uint64_t *seq);
+ 	int waitBuf(uint32_t handle, uint32_t timeout_us);
++	IOReturn flushBuf(uint32_t handle);
+ 	int as(void) const { return ctx.as; }
+ 
+ private:
+@@ -413,6 +419,25 @@ D2SGPUSpace::waitBuf(uint32_t handle, uint32_t timeout_us)
+ 	return rc;
+ }
+ 
++/* Write back and drop a buffer's cache lines now, without waiting. */
++IOReturn
++D2SGPUSpace::flushBuf(uint32_t handle)
++{
++	if (handle < 1 || handle > MAX_BUFS) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn ret = kIOReturnBadArgument;
++	IOLockLock(lock);
++	if (bufs[handle - 1].md != NULL) {
++		if (bufs[handle - 1].kva != 0) {
++			d2s_gpu_flush(bufs[handle - 1].kva, bufs[handle - 1].size);
++		}
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(lock);
++	return ret;
++}
++
+ /* ---- the service ----------------------------------------------------- */
+ 
+ class D2SGPU : public IOService {
+@@ -739,6 +764,28 @@ D2SGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a
+ 		a->scalarOutput[0] = (uint64_t)space->waitBuf((uint32_t)a->scalarInput[0], t);
+ 		return kIOReturnSuccess;
+ 	}
++	case 9: {	/* READ_REGS */
++		uint32_t n = a->structureInputSize / 4;
++		if (a->structureInput == NULL || n == 0 || n > 64 || a->structureOutput == NULL ||
++		    a->structureOutputSize < n * 4) {
++			return kIOReturnBadArgument;
++		}
++		const uint32_t *offs = (const uint32_t *)a->structureInput;
++		uint32_t *vals = (uint32_t *)a->structureOutput;
++		for (uint32_t i = 0; i < n; i++) {
++			if (!d2s_gpu_read_reg(offs[i], &vals[i])) {
++				return kIOReturnBadArgument;
++			}
++		}
++		a->structureOutputSize = n * 4;
++		return kIOReturnSuccess;
++	}
++	case 10: {	/* BUF_FLUSH */
++		if (a->scalarInputCount != 1) {
++			return kIOReturnBadArgument;
++		}
++		return space->flushBuf((uint32_t)a->scalarInput[0]);
++	}
+ 	default:
+ 		return kIOReturnUnsupported;
+ 	}

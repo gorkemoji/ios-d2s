@@ -150,14 +150,28 @@ after_done(uint64_t done_seq)
 	pthread_mutex_unlock(&lock);
 }
 
-/* Wait for seq until the absolute CLOCK_MONOTONIC time abs_ns; D2SGPU
- * waits are capped at 5 s, so loop. Returns the job's rc or TIMEOUT. */
+/*
+ * Microseconds left until the absolute CLOCK_MONOTONIC time abs_ns, capped at
+ * the 5 s a D2SGPU wait takes. Mesa passes "forever" as OS_TIMEOUT_INFINITE,
+ * all ones, which is -1 here: a negative deadline means forever.
+ */
+static uint32_t
+left_us(int64_t abs_ns)
+{
+	if (abs_ns < 0) {
+		return 5000000;
+	}
+	int64_t left = abs_ns - now_ns();
+	return left <= 0 ? 0 : left / 1000 > 5000000 ? 5000000 : (uint32_t)(left / 1000);
+}
+
+/* Wait for seq until abs_ns (see left_us); D2SGPU waits are capped at 5 s,
+ * so loop. Returns the job's rc or TIMEOUT. */
 static uint64_t
 wait_seq(uint64_t seq, int64_t abs_ns)
 {
 	for (;;) {
-		int64_t left = abs_ns - now_ns();
-		uint32_t us = left <= 0 ? 0 : left / 1000 > 5000000 ? 5000000 : (uint32_t)(left / 1000);
+		uint32_t us = left_us(abs_ns);
 		struct d2sgpu_wait_result w = { 0 };
 		if (d2sgpu_wait(conn, seq, us, &w) != KERN_SUCCESS) {
 			return D2SGPU_JOB_INVALID;
@@ -607,10 +621,13 @@ wait_bo(struct drm_panfrost_wait_bo *a)
 		return fail(EINVAL);
 	}
 	struct d2sgpu_buf b = bo->buf;
-	int64_t left = a->timeout_ns - now_ns();	/* absolute, like the kernel's */
-	uint32_t us = left <= 0 ? 0 : left / 1000 > 5000000 ? 5000000 : (uint32_t)(left / 1000);
 	pthread_mutex_unlock(&lock);
-	uint64_t rc = d2sgpu_buf_wait(conn, &b, us);
+	uint64_t rc;
+	uint32_t us;
+	do {	/* absolute deadline, like the kernel's; negative = forever */
+		us = left_us(a->timeout_ns);
+		rc = d2sgpu_buf_wait(conn, &b, us);
+	} while (rc == D2SGPU_JOB_TIMEOUT && us == 5000000);
 	pthread_mutex_lock(&lock);
 	return rc == D2SGPU_JOB_TIMEOUT ? fail(ETIMEDOUT) : 0;
 }

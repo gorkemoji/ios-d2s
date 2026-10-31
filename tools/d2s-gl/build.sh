@@ -135,7 +135,7 @@ set +e
 	-framework IOKit -framework IOSurface -framework CoreFoundation -lz > "$OUT/link.log" 2>&1
 rc=$?
 set -e
-grep -v 'warning:' "$OUT/link.log" | head -80
+grep -v 'warning:' "$OUT/link.log" | head -80 || true
 [ $rc -eq 0 ] || { echo "link failed ($rc)"; exit 1; }
 codesign -f -s - "$OUT/pantest.dylib"
 file "$OUT/pantest.dylib"

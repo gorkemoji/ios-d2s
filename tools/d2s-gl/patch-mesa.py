@@ -40,6 +40,23 @@ EDITS = [
     ('src/panfrost/lib/kmod/pan_kmod.h',
      'static inline void *\npan_kmod_bo_mmap(',
      DECL + '\nstatic inline void *\npan_kmod_bo_mmap('),
+    # Performance-counter sessions are Linux-only (eventfd, timerfd, an RT
+    # scheduler) and d2sdrm has no counters: no session on Apple platforms.
+    ('src/panfrost/lib/kmod/panfrost_kmod.c',
+     '   int ret = sched_setscheduler(0, SCHED_FIFO, &rt_params);\n',
+     '#if defined(__APPLE__)\n'
+     '   (void)rt_params;\n   int ret = 0;\n'
+     '#else\n'
+     '   int ret = sched_setscheduler(0, SCHED_FIFO, &rt_params);\n'
+     '#endif\n'),
+    ('src/panfrost/lib/kmod/panfrost_kmod.c',
+     '   struct panfrost_kmod_perf_session *session;\n\n'
+     '   session = pan_kmod_dev_alloc(dev, sizeof(*session));\n',
+     '   struct panfrost_kmod_perf_session *session;\n\n'
+     '#if defined(__APPLE__)\n'
+     '   (void)caps;\n   (void)backend;\n   return NULL;\n'
+     '#endif\n'
+     '   session = pan_kmod_dev_alloc(dev, sizeof(*session));\n'),
     ('src/gallium/drivers/panfrost/pan_bo.c',
      '   if (os_munmap((void *)(uintptr_t)bo->ptr.cpu, panfrost_bo_size(bo))) {',
      '#if defined(__APPLE__)\n'

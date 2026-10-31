@@ -86,6 +86,12 @@ if [ ! -f "$W/ios/build.ninja" ]; then
 		-Ddefault_library=static -Db_ndebug=true
 fi
 ninja -C "$W/ios" -k 0
+# Mesa's internal libraries (util, nir, compiler, gallium auxiliary, ...) are
+# not built by default when nothing in the build links them, as here: build
+# every static library target.
+ninja -C "$W/ios" -t targets all | sed -n 's/^\([^:]*\.a\): .*/\1/p' | sort -u > "$W/static-targets.txt"
+echo "$(wc -l < "$W/static-targets.txt") static library targets"
+ninja -C "$W/ios" -k 0 $(cat "$W/static-targets.txt")
 
 echo "=== pantest.dylib"
 python3 - "$W/ios" > "$W/pan_flags.txt" <<'PY'

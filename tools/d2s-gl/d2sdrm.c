@@ -582,24 +582,78 @@ drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src
 	return d != NULL && s != NULL ? 0 : -EINVAL;
 }
 
-/* Sync files would carry fences to other processes and are not supported:
- * exporting fails (callers then wait in this process instead). */
+/*
+ * Sync files. panfrost makes every fence by exporting its context syncobj as
+ * a sync file and importing that into a new syncobj (pan_fence.c). Here a
+ * sync file is a placeholder descriptor on /dev/null that records a snapshot
+ * of the syncobj (signalled, or the job's sequence number; the numbers come
+ * from one queue for all processes). Descriptor numbers are reused after
+ * close(), which d2sdrm does not see, so a new export with the same number
+ * replaces the old record; the table is a ring otherwise.
+ */
+#define MAX_SYNC_FILES	256
+static struct {
+	int fd;			/* 0: free */
+	int signaled;
+	uint64_t seq;
+} sync_files[MAX_SYNC_FILES];
+static unsigned sync_file_next;
+
 int
 drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd)
 {
-	(void)fd;
-	(void)handle;
 	*sync_file_fd = -1;
-	return -ENOSYS;
+	if (!is_dev(fd)) {
+		return -EBADF;
+	}
+	int sf = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	if (sf < 0) {
+		return -errno;
+	}
+	pthread_mutex_lock(&lock);
+	struct syncobj *s = sync_get(handle);
+	if (s == NULL || (!s->signaled && s->seq == 0)) {
+		pthread_mutex_unlock(&lock);
+		close(sf);
+		return -EINVAL;		/* no fence to export, as on Linux */
+	}
+	unsigned slot = MAX_SYNC_FILES;
+	for (unsigned i = 0; i < MAX_SYNC_FILES; i++) {
+		if (sync_files[i].fd == sf) {
+			slot = i;	/* a stale record for a reused number */
+			break;
+		}
+	}
+	if (slot == MAX_SYNC_FILES) {
+		slot = sync_file_next++ % MAX_SYNC_FILES;
+	}
+	sync_files[slot].fd = sf;
+	sync_files[slot].signaled = s->signaled;
+	sync_files[slot].seq = s->seq;
+	pthread_mutex_unlock(&lock);
+	*sync_file_fd = sf;
+	return 0;
 }
 
 int
 drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd)
 {
-	(void)fd;
-	(void)handle;
-	(void)sync_file_fd;
-	return -ENOSYS;
+	if (!is_dev(fd) || sync_file_fd <= 0) {
+		return -EINVAL;
+	}
+	int ret = -EINVAL;
+	pthread_mutex_lock(&lock);
+	struct syncobj *s = sync_get(handle);
+	for (unsigned i = 0; s != NULL && i < MAX_SYNC_FILES; i++) {
+		if (sync_files[i].fd == sync_file_fd) {
+			s->signaled = sync_files[i].signaled;
+			s->seq = sync_files[i].seq;
+			ret = 0;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+	return ret;
 }
 
 int

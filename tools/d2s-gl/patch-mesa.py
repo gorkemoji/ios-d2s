@@ -3,6 +3,8 @@
 
   patch-mesa.py MESA_DIR
 
+meson.build: look for libdrm on Darwin too (finds tools/d2s-gl/libdrm).
+
 panfrost buffers are mapped once by d2sdrm (tools/d2s-gl/d2sdrm.c), when
 they are created or imported, so on Apple platforms:
   - pan_kmod_bo_mmap() asks d2sdrm_mmap() for that mapping instead of
@@ -21,6 +23,12 @@ DECL = ('#if defined(__APPLE__)\n'
         '#endif\n')
 
 EDITS = [
+    # Darwin has no kernel DRM, so Mesa never looks for libdrm there; look
+    # anyway (optional there), so tools/d2s-gl/libdrm is found and
+    # HAVE_LIBDRM is set.
+    ('meson.build',
+     "with_gallium_drisw_kms = false\nif system_has_kms_drm\n",
+     "with_gallium_drisw_kms = false\nif system_has_kms_drm or host_machine.system() == 'darwin'\n"),
     ('src/panfrost/lib/kmod/pan_kmod.h',
      '   host_addr =\n      os_mmap(host_addr, bo->size, prot, flags, bo->dev->fd, mmap_offset);\n',
      '#if defined(__APPLE__)\n'
